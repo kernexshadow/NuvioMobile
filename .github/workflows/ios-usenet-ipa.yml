@@ -1,0 +1,87 @@
+name: Usenet iOS IPA
+
+on:
+  push:
+    branches: [feat/usenet-ios]
+  workflow_dispatch:
+    inputs:
+      configuration:
+        description: Production-optimized or fast validation build
+        required: true
+        type: choice
+        options:
+          - Debug
+          - Release
+        default: Debug
+
+permissions:
+  contents: read
+
+concurrency:
+  group: usenet-ios-ipa-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    name: Build unsigned full IPA
+    runs-on: macos-26
+    timeout-minutes: 90
+    env:
+      GRADLE_OPTS: -Dfile.encoding=UTF-8
+      IOS_CONFIGURATION: ${{ inputs.configuration || 'Debug' }}
+      KOTLIN_DAEMON_JVMARGS: -Xmx2048M
+      NUVIO_GRADLE_JVMARGS: -Xmx4608M -Dfile.encoding=UTF-8 -XX:MaxMetaspaceSize=768M
+      NUVIO_KOTLIN_NATIVE_JVMARGS: -Xmx4608M
+      RELEASE_PROPERTIES_BASE64: ${{ secrets.NUVIO_LOCAL_PROPERTIES_BASE64 }}
+
+    steps:
+      - name: Check out source
+        uses: actions/checkout@v6
+
+      - name: Select the newest Xcode
+        run: |
+          ls -d /Applications/Xcode*.app
+          xcode="$(ls -d /Applications/Xcode_*.app | sort -V | tail -n 1)"
+          echo "DEVELOPER_DIR=${xcode}/Contents/Developer" >> "${GITHUB_ENV}"
+
+      - name: Set up Java
+        uses: actions/setup-java@v5
+        with:
+          distribution: temurin
+          java-version: 17
+
+      - name: Set up Gradle
+        uses: gradle/actions/setup-gradle@v6
+
+      - name: Cache Kotlin Native
+        uses: actions/cache@v5
+        with:
+          path: ~/.konan
+          key: konan-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('gradle/libs.versions.toml') }}
+          restore-keys: |
+            konan-${{ runner.os }}-${{ runner.arch }}-
+
+      - name: Verify Apple toolchain
+        run: |
+          xcodebuild -version
+          xcrun --sdk iphoneos --show-sdk-version
+
+      - name: Configure runtime properties
+        if: env.RELEASE_PROPERTIES_BASE64 != ''
+        run: |
+          printf '%s' "${RELEASE_PROPERTIES_BASE64}" | base64 --decode > local.properties
+          sed -i '' -E '/^[[:space:]]*(sdk\.dir|NUVIO_RELEASE_STORE_FILE)[[:space:]]*=/d' local.properties
+
+      - name: Prepare iOS dependencies
+        run: ./scripts/prepare-ios-dependencies.sh
+
+      - name: Build unsigned full IPA
+        run: ./scripts/build-ios-ipa.sh
+
+      - name: Upload IPA
+        uses: actions/upload-artifact@v7
+        with:
+          name: nuvio-usenet-${{ env.IOS_CONFIGURATION }}-ipa-${{ github.sha }}
+          path: build/ios-ipa/*.ipa
+          if-no-files-found: error
+          retention-days: 14

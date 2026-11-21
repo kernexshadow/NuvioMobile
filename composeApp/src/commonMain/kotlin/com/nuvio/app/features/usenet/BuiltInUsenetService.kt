@@ -123,7 +123,7 @@ internal class BuiltInUsenetService(
             val enabled = config.indexers.filter { it.enabled }
             // Every indexer is searched at once unless the user chose priority fallback: then equal
             // priorities are searched together and lower ones only when nothing playable was found.
-            val tiers = if (config.indexerFallback) enabled.groupBy { it.priority }.toSortedMap().values.toList() else listOf(enabled)
+            val tiers = if (config.indexerFallback) enabled.groupBy { it.priority }.entries.sortedBy { it.key }.map { it.value } else listOf(enabled)
             for (tier in tiers) {
                 val results = Channel<Pair<UsenetIndexer, Result<List<UsenetRelease>>>>(Channel.UNLIMITED)
                 val jobs = tier.map { indexer ->

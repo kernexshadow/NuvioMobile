@@ -1,11 +1,11 @@
 package com.nuvio.app.features.usenet
 
-import android.content.Context
+import co.touchlab.kermit.Logger
 import com.nuvio.app.features.streams.StreamItem
-import java.net.URI
-import java.security.MessageDigest
-import java.util.Locale
+import com.nuvio.app.features.streams.epochMs
 import kotlin.math.abs
+import kotlinx.atomicfu.locks.SynchronizedObject
+import kotlinx.atomicfu.locks.synchronized
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
@@ -13,29 +13,12 @@ import kotlinx.serialization.Serializable
 import kotlinx.serialization.encodeToString
 import kotlinx.serialization.json.Json
 
-/** Where [UnplayableReleases] persists; the app uses private SharedPreferences. */
+/** Where [UnplayableReleases] persists; the app uses private platform preferences. */
 internal interface UnplayableReleaseStorage {
     fun load(): String?
     fun save(value: String)
     /** Changes when the stored list is cleared from outside, so a loaded copy is dropped. */
     val generation: Int get() = 0
-}
-
-internal class SharedPreferencesUnplayableReleaseStorage(context: Context) : UnplayableReleaseStorage {
-    private val preferences = context.getSharedPreferences("usenet_unplayable_releases", Context.MODE_PRIVATE)
-
-    override fun load(): String? = preferences.getString(KEY, null)
-    override fun save(value: String) { preferences.edit().putString(KEY, value).apply() }
-    @Volatile override var generation = 0
-        private set
-
-    // Holds no credentials and is shared by profiles; only an account reset clears it.
-    fun clear() {
-        preferences.edit().clear().apply()
-        generation += 1
-    }
-
-    private companion object { const val KEY = "releases" }
 }
 
 @Serializable
@@ -62,9 +45,10 @@ internal class UnplayableReleases(
     private val storage: UnplayableReleaseStorage,
     /** Bumped when a release is remembered; the app hands in one that exists before this does. */
     private val changes: MutableStateFlow<Int> = MutableStateFlow(0),
-    private val now: () -> Long = System::currentTimeMillis
+    private val now: () -> Long = ::epochMs
 ) {
     private val json = Json { ignoreUnknownKeys = true }
+    private val lock = SynchronizedObject()
     /** Increments when a release is remembered, so a shown result list can be arranged again. */
     val revision: StateFlow<Int> = changes.asStateFlow()
     private var loaded: MutableMap<String, UnplayableRelease>? = null
@@ -80,11 +64,10 @@ internal class UnplayableReleases(
         }
 
     /** Remembers a release whose open or playback failed with an engine [kind] in [KINDS]; others are ignored. */
-    @Synchronized
-    fun record(nzbUrl: String?, title: String?, size: Long?, servers: List<String>, kind: String?, posted: Long? = null) {
+    fun record(nzbUrl: String?, title: String?, size: Long?, servers: List<String>, kind: String?, posted: Long? = null): Unit = synchronized(lock) {
         if (kind !in KINDS) return
         if (put(nzbUrl, title, size, servers, requireNotNull(kind), posted)) {
-            runCatching { android.util.Log.i("UsenetUnplayable", "remembered kind=$kind release=\"${title?.lineSequence()?.firstOrNull()}\" size=${size ?: 0}") }
+            runCatching { Logger.withTag("UsenetUnplayable").i { "remembered kind=$kind release=\"${title?.lineSequence()?.firstOrNull()}\" size=${size ?: 0}" } }
         }
     }
 
@@ -93,8 +76,7 @@ internal class UnplayableReleases(
      * a newer success: a release already marked within a day is not written again, unless its
      * upload's newest outcome is another episode's.
      */
-    @Synchronized
-    fun recordPlayed(nzbUrl: String?, title: String?, size: Long?, servers: List<String>, posted: Long? = null) {
+    fun recordPlayed(nzbUrl: String?, title: String?, size: Long?, servers: List<String>, posted: Long? = null): Unit = synchronized(lock) {
         val known = find(nzbUrl, title, size, servers, posted)
         val siblingsKnow = siblingKey(title)?.let { (key, episode) ->
             entries[key]?.let { it.kind == PLAYED && it.episode == episode && it.posted == posted } == true
@@ -138,8 +120,7 @@ internal class UnplayableReleases(
         outcome(nzbUrl, title, size, servers, posted).played
 
     /** [contains] and [played] from one lookup: a result list asks both of hundreds of releases. */
-    @Synchronized
-    fun outcome(nzbUrl: String?, title: String?, size: Long?, servers: List<String>, posted: Long? = null): ReleaseOutcome {
+    fun outcome(nzbUrl: String?, title: String?, size: Long?, servers: List<String>, posted: Long? = null): ReleaseOutcome = synchronized(lock) {
         val entry = find(nzbUrl, title, size, servers, posted) ?: return ReleaseOutcome()
         val age = now() - entry.at
         return ReleaseOutcome(failed = entry.kind in KINDS && age <= RETENTION_MS, played = entry.kind == PLAYED && age <= PLAYED_MS)
@@ -151,8 +132,7 @@ internal class UnplayableReleases(
      * A repost of the same title is another upload: only a release [posted] about when that
      * episode was, allowing a week per episode between them as a season airs, is told.
      */
-    @Synchronized
-    fun sibling(title: String?, servers: List<String>, posted: Long?): SiblingOutcome? {
+    fun sibling(title: String?, servers: List<String>, posted: Long?): SiblingOutcome? = synchronized(lock) {
         val (key, episode) = siblingKey(title) ?: return null
         val entry = entries[key]?.takeIf { it.episode != null && it.episode != episode } ?: return null
         if (entry.providers != providersKey(servers) && entry.kind != BLANK) return null
@@ -169,7 +149,7 @@ internal class UnplayableReleases(
     fun sibling(stream: StreamItem): SiblingOutcome? = sibling(stream.title, stream.nzbServers, stream.publishedAt)
 
     private fun siblingKey(title: String?): Pair<String, Int>? {
-        val name = title?.trim()?.lowercase(Locale.ROOT)?.takeIf { it.isNotEmpty() } ?: return null
+        val name = title?.trim()?.lowercase()?.takeIf { it.isNotEmpty() } ?: return null
         return NewznabProtocol.episodeTemplate(name)?.let { (template, episode) -> "s:" + sha256(template) to episode }
     }
 
@@ -187,7 +167,7 @@ internal class UnplayableReleases(
 
     /** The keys of a release at each of [megabytes]; every key is hashed once, which is what a lookup costs. */
     private fun keys(nzbUrl: String?, title: String?, megabytes: List<Long?>): List<String> {
-        val name = title?.trim()?.lowercase(Locale.ROOT)?.takeIf { it.isNotEmpty() }
+        val name = title?.trim()?.lowercase()?.takeIf { it.isNotEmpty() }
         val titles = when {
             name == null -> emptyList()
             // A season pack's title names it, and its listed size changes once the episode count
@@ -205,24 +185,12 @@ internal class UnplayableReleases(
     private fun providersKey(servers: List<String>): String {
         // A search asks with the same providers for every result.
         if (servers == lastServers) return lastProvidersKey
-        return sha256(servers.map { server ->
-            runCatching { URI(server).let { "${it.scheme}://${it.host}:${it.port}" } }.getOrDefault("")
-        }.distinct().sorted().joinToString("\n")).also { lastServers = servers; lastProvidersKey = it }
+        return sha256(servers.map(::serverAddress).distinct().sorted().joinToString("\n"))
+            .also { lastServers = servers; lastProvidersKey = it }
     }
 
-    // Looking a digest up is slow on some devices: one instance serves every hash, under the
-    // synchronized public calls. Lowercase hex, as stored entries already are.
-    private val digest = MessageDigest.getInstance("SHA-256")
-
-    private fun sha256(value: String): String {
-        val bytes = digest.digest(value.toByteArray())
-        val hex = CharArray(bytes.size * 2)
-        bytes.forEachIndexed { i, b ->
-            hex[i * 2] = HEX[(b.toInt() shr 4) and 0xf]
-            hex[i * 2 + 1] = HEX[b.toInt() and 0xf]
-        }
-        return String(hex)
-    }
+    /** Lowercase hex, as stored entries already are. */
+    private fun sha256(value: String): String = UsenetText.sha256Hex(value)
 
     companion object {
         /** Engine failures that the same release repeats with the same providers. */
@@ -238,19 +206,24 @@ internal class UnplayableReleases(
         /** An airing season's episodes are posted about a week apart; a whole season at once. */
         private const val EPISODE_INTERVAL_MS = 8L * 24 * 3600 * 1000
         private const val POSTING_SLACK_MS = 2L * 24 * 3600 * 1000
-        private val HEX = "0123456789abcdef".toCharArray()
         private const val MAX_ENTRIES = 2000
         private const val MB = 1_000_000L
-
-        @Volatile private var storage: SharedPreferencesUnplayableReleaseStorage? = null
-        @Volatile private var instance: UnplayableReleases? = null
-
-        fun storage(context: Context): SharedPreferencesUnplayableReleaseStorage = storage ?: synchronized(this) {
-            storage ?: SharedPreferencesUnplayableReleaseStorage(context.applicationContext).also { storage = it }
-        }
-
-        fun get(context: Context): UnplayableReleases = instance ?: synchronized(this) {
-            instance ?: UnplayableReleases(storage(context)).also { instance = it }
-        }
     }
+}
+
+/**
+ * A server URL's scheme, host and port as java.net.URI gives them ("nntps://host:563"); its
+ * credentials, connections and priority are left out. Empty for a URL that cannot be read.
+ */
+internal fun serverAddress(server: String): String {
+    val scheme = server.substringBefore("://", "").takeIf { it.isNotEmpty() && it.first().isLetter() } ?: return ""
+    val authority = server.substringAfter("://").substringBefore('/').substringBefore('?').substringBefore('#')
+    val hostAndPort = authority.substringAfterLast('@')
+    val (host, port) = if (hostAndPort.startsWith('[')) {
+        hostAndPort.substringBefore(']') + "]" to hostAndPort.substringAfter("]", "").removePrefix(":")
+    } else {
+        hostAndPort.substringBefore(':') to hostAndPort.substringAfter(':', "")
+    }
+    if (!isValidHost(host)) return ""
+    return "$scheme://$host:${if (port.isEmpty()) -1 else port.toIntOrNull() ?: return ""}"
 }

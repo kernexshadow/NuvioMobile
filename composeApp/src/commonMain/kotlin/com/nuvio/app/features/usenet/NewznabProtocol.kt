@@ -1,16 +1,8 @@
 package com.nuvio.app.features.usenet
 
-import java.io.StringReader
-import java.text.Normalizer
-import java.time.ZonedDateTime
-import java.time.Instant
-import java.time.format.DateTimeFormatter
-import java.util.Locale
-import javax.xml.parsers.DocumentBuilderFactory
-import okhttp3.HttpUrl
-import okhttp3.HttpUrl.Companion.toHttpUrl
-import org.w3c.dom.Element
-import org.xml.sax.InputSource
+import com.nuvio.app.features.streams.epochMs
+import io.ktor.http.URLBuilder
+import io.ktor.http.Url
 
 internal data class UsenetSearchRequest(
     val imdbId: String? = null,
@@ -86,15 +78,18 @@ internal data class UsenetRelease(
 /** [items] counts the page's items, usable or not; [total] is null when the indexer reports none. */
 internal data class NewznabPage(val releases: List<UsenetRelease>, val total: Int? = null, val items: Int = releases.size)
 
-/** Protocol functions are independent of Android and never include credentials in errors. */
+/** Protocol functions are independent of the platform and never include credentials in errors. */
 internal object NewznabProtocol {
-    fun apiUrl(indexer: UsenetIndexer, action: String): HttpUrl.Builder = indexer.endpoint.toHttpUrl()
-        .newBuilder().setQueryParameter("apikey", indexer.apiKey)
+    fun apiUrl(indexer: UsenetIndexer, action: String): URLBuilder = URLBuilder(endpointOf(indexer))
+        .setQueryParameter("apikey", indexer.apiKey)
         .setQueryParameter("t", action).setQueryParameter("o", "xml")
+
+    private fun endpointOf(indexer: UsenetIndexer): Url =
+        requireNotNull(httpUrlOrNull(indexer.endpoint)) { "Invalid indexer endpoint" }
 
     /** [wholeSeason] drops the episode from an ID search so one request covers a season. */
     fun searchUrl(indexer: UsenetIndexer, request: UsenetSearchRequest,
-        caps: NewznabCapabilities, offset: Int = 0, wholeSeason: Boolean = false): HttpUrl? {
+        caps: NewznabCapabilities, offset: Int = 0, wholeSeason: Boolean = false): Url? {
         val params = if (request.series) caps.tvParams else caps.movieParams
         val builder = apiUrl(indexer, if (request.series) "tvsearch" else "movie")
         val idParam = when {
@@ -119,7 +114,7 @@ internal object NewznabProtocol {
             }
             val query = if (request.series) {
                 title + if (request.season != null && request.episode != null) {
-                    " S%02dE%02d".format(Locale.ROOT, request.season, request.episode)
+                    " S${request.season.toString().padStart(2, '0')}E${request.episode.toString().padStart(2, '0')}"
                 } else ""
             } else title
             builder.setQueryParameter("q", query)
@@ -140,7 +135,7 @@ internal object NewznabProtocol {
     }
 
     /** Whether [url] names the content by id rather than by title. */
-    fun isIdSearch(url: HttpUrl) = ID_PARAMS.any { url.queryParameter(it) != null }
+    fun isIdSearch(url: Url) = ID_PARAMS.any { url.queryParameter(it) != null }
 
     private val ID_PARAMS = listOf("imdbid", "tvdbid", "tmdbid")
 
@@ -148,49 +143,40 @@ internal object NewznabProtocol {
         val root = document(xml)
         require(root.localName == "caps") { "Invalid indexer capabilities response" }
         fun params(tag: String): Set<String> {
-            val element = root.getElementsByTagName(tag).item(0) as? Element ?: return emptySet()
-            if (element.getAttribute("available") != "yes") return emptySet()
-            return element.getAttribute("supportedParams").split(',').map { it.trim().lowercase() }.toSet()
+            val element = root.elementsNamed(tag).firstOrNull() ?: return emptySet()
+            if (element.attribute("available") != "yes") return emptySet()
+            return element.attribute("supportedParams").split(',').map { it.trim().lowercase() }.toSet()
         }
-        val limits = root.getElementsByTagName("limits").item(0) as? Element
-        val search = root.getElementsByTagName("search").item(0) as? Element
+        val limits = root.elementsNamed("limits").firstOrNull()
+        val search = root.elementsNamed("search").firstOrNull()
         return NewznabCapabilities(params("movie-search"), params("tv-search"),
-            search?.getAttribute("available") == "yes",
-            limits?.getAttribute("max")?.toIntOrNull()?.coerceIn(1, 100) ?: 100)
+            search?.attribute("available") == "yes",
+            limits?.attribute("max")?.toIntOrNull()?.coerceIn(1, 100) ?: 100)
     }
 
     fun releases(xml: String, indexer: UsenetIndexer): NewznabPage {
         val root = document(xml)
         require(root.localName == "rss") { "Invalid indexer search response" }
-        val items = root.getElementsByTagName("item")
-        val results = (0 until items.length).mapNotNull { i ->
-            val item = items.item(i) as Element
-            fun text(tag: String) = item.getElementsByTagName(tag).item(0)?.textContent?.trim().orEmpty()
-            val attrs = item.getElementsByTagNameNS("*", "attr")
-            val attributes = (0 until attrs.length).associate { j ->
-                val attr = attrs.item(j) as Element
-                attr.getAttribute("name").lowercase() to attr.getAttribute("value")
+        val items = root.elementsNamed("item")
+        val endpoint = endpointOf(indexer)
+        val results = items.mapNotNull { item ->
+            fun text(tag: String) = item.elementsNamed(tag).firstOrNull()?.textContent?.trim().orEmpty()
+            val attributes = item.elementsLocallyNamed("attr").associate { attr ->
+                attr.attribute("name").lowercase() to attr.attribute("value")
             }
-            val enclosures = item.getElementsByTagName("enclosure")
-            val enclosure = (0 until enclosures.length).map { enclosures.item(it) as Element }
-                .firstOrNull { it.getAttribute("type").contains("nzb", ignoreCase = true) }
-            val download = enclosure?.getAttribute("url")?.takeIf { it.isNotBlank() }
-                ?: text("link").takeIf { it.isNotBlank() && enclosures.length == 0 } ?: return@mapNotNull null
-            val url = indexer.endpoint.toHttpUrl().resolve(download) ?: return@mapNotNull null
+            val enclosures = item.elementsNamed("enclosure")
+            val enclosure = enclosures.firstOrNull { it.attribute("type").contains("nzb", ignoreCase = true) }
+            val download = enclosure?.attribute("url")?.takeIf { it.isNotBlank() }
+                ?: text("link").takeIf { it.isNotBlank() && enclosures.isEmpty() } ?: return@mapNotNull null
+            val url = endpoint.resolve(download) ?: return@mapNotNull null
             val title = text("title").takeIf { it.isNotBlank() } ?: return@mapNotNull null
-            val published = listOfNotNull(attributes["usenetdate"], text("pubDate")).firstNotNullOfOrNull { date ->
-                runCatching { ZonedDateTime.parse(date, DateTimeFormatter.RFC_1123_DATE_TIME).toInstant().toEpochMilli() }.getOrNull()
-                    ?: runCatching { Instant.parse(date).toEpochMilli() }.getOrNull()
-                    ?: date.toLongOrNull()?.takeIf { it > 0 && it < Long.MAX_VALUE / 1000 }?.let {
-                        if (it < 100000000000L) it * 1000 else it
-                    }
-            } ?: 0
+            val published = listOfNotNull(attributes["usenetdate"], text("pubDate")).firstNotNullOfOrNull(NewznabDates::parse) ?: 0
             UsenetRelease(title, url.toString(),
-                (attributes["size"]?.toLongOrNull() ?: enclosure?.getAttribute("length")?.toLongOrNull() ?: 0).coerceAtLeast(0),
+                (attributes["size"]?.toLongOrNull() ?: enclosure?.attribute("length")?.toLongOrNull() ?: 0).coerceAtLeast(0),
                 published, indexer.id, indexer.name, attributes["password"]?.lowercase() in setOf("1", "2", "true", "yes"))
         }
-        val response = root.getElementsByTagNameNS("*", "response").item(0) as? Element
-        return NewznabPage(results, response?.getAttribute("total")?.toIntOrNull(), items.length)
+        val response = root.elementsLocallyNamed("response").firstOrNull()
+        return NewznabPage(results, response?.attribute("total")?.toIntOrNull(), items.size)
     }
 
     /**
@@ -406,8 +392,8 @@ internal object NewznabProtocol {
             }
         }
         // Only marks on Latin letters: in other scripts (kana voicing) they are part of the letter.
-        val unaccented = withoutLatinMarks(Normalizer.normalize(letters, Normalizer.Form.NFD))
-        return Normalizer.normalize(unaccented, Normalizer.Form.NFC).replace(APOSTROPHES, "")
+        val unaccented = withoutLatinMarks(UsenetText.decomposed(letters))
+        return UsenetText.composed(unaccented).replace(APOSTROPHES, "")
     }
 
     /**
@@ -427,13 +413,13 @@ internal object NewznabProtocol {
     }
 
     /** Lowercase words of a title or release name, for comparing one with the other. */
-    private fun words(value: String, umlauts: Boolean = true) = releaseSpelling(value, umlauts).lowercase(Locale.ROOT)
+    private fun words(value: String, umlauts: Boolean = true) = releaseSpelling(value, umlauts).lowercase()
         .replace("&", " and ").replace(NON_WORD, " ").trim()
 
     /** Whether [value] has a Latin letter, the script indexers search and name releases in. */
     fun hasLatinLetter(value: String) = value.any { it.isLatinLetter() }
 
-    private fun Char.isLatinLetter() = isLetter() && Character.UnicodeScript.of(code) == Character.UnicodeScript.LATIN
+    private fun Char.isLatinLetter() = UsenetText.isLatinLetter(this)
 
     private fun Char.isCombiningMark() = category.let { it == CharCategory.NON_SPACING_MARK || it == CharCategory.COMBINING_SPACING_MARK || it == CharCategory.ENCLOSING_MARK }
 
@@ -447,11 +433,11 @@ internal object NewznabProtocol {
      * ignoring case and punctuation, since indexers write separators differently.
      */
     fun withoutDuplicates(releases: List<UsenetRelease>, config: UsenetSourceConfiguration,
-        now: Long = System.currentTimeMillis(), seasonEpisodes: Map<Int, Int>? = null,
+        now: Long = epochMs(), seasonEpisodes: Map<Int, Int>? = null,
         series: Boolean = false): List<UsenetRelease> {
         val order = config.indexers.mapIndexed { i, indexer -> indexer.id to i }.toMap()
         fun name(release: UsenetRelease) =
-            release.title.lowercase(Locale.ROOT).replace(NON_WORD, " ").trim()
+            release.title.lowercase().replace(NON_WORD, " ").trim()
         return releases.groupBy(::name).values.map { copies ->
             // A preferred copy hidden by a filter (no size, passworded) must not hide the others.
             copies.filter { arrange(listOf(it), config, now, seasonEpisodes, series).isNotEmpty() }.ifEmpty { copies }
@@ -465,7 +451,7 @@ internal object NewznabProtocol {
      * the ones cut and unplayable ones are cut first.
      */
     fun arrange(releases: List<UsenetRelease>, config: UsenetSourceConfiguration,
-        now: Long = System.currentTimeMillis(), seasonEpisodes: Map<Int, Int>? = null, series: Boolean = false,
+        now: Long = epochMs(), seasonEpisodes: Map<Int, Int>? = null, series: Boolean = false,
         rank: (UsenetRelease) -> Int = { 0 }): List<UsenetRelease> {
         val priority = config.indexers.mapIndexed { i, indexer -> indexer.id to i }.toMap()
         val filtered = releases.filter {
@@ -504,12 +490,11 @@ internal object NewznabProtocol {
             .distinctBy { it.nzbUrl }.take(config.resultLimit)
     }
 
-    private fun document(xml: String): Element {
+    private fun document(xml: String): UsenetXmlElement {
         require(!xml.contains("<!DOCTYPE", true) && !xml.contains("<!ENTITY", true)) { "Invalid indexer XML" }
-        val factory = DocumentBuilderFactory.newInstance().apply { isNamespaceAware = true; isExpandEntityReferences = false }
-        val root = factory.newDocumentBuilder().parse(InputSource(StringReader(xml))).documentElement
+        val root = UsenetXml.parse(xml)
         if (root.localName == "error") {
-            val code = root.getAttribute("code")
+            val code = root.attribute("code")
             if (code in setOf("429", "500", "501")) throw NewznabQuotaException()
             if (code in setOf("100", "101", "102")) throw NewznabAuthException()
             if (code in setOf("200", "201", "202", "203")) throw NewznabUnsupportedSearchException()

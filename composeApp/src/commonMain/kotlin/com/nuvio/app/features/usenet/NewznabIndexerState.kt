@@ -1,6 +1,7 @@
 package com.nuvio.app.features.usenet
 
-import android.content.Context
+import kotlinx.atomicfu.locks.SynchronizedObject
+import kotlinx.atomicfu.locks.synchronized
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
@@ -8,29 +9,12 @@ import kotlinx.serialization.Serializable
 import kotlinx.serialization.encodeToString
 import kotlinx.serialization.json.Json
 
-/** Where [NewznabIndexerStates] persists; the app uses private SharedPreferences. */
+/** Where [NewznabIndexerStates] persists; the app uses private platform preferences. */
 internal interface NewznabStateStorage {
     fun load(): String?
     fun save(value: String)
     /** Changes when the stored state is cleared from outside, so a loaded copy is dropped. */
     val generation: Int get() = 0
-}
-
-/** Holds no credentials and is shared by profiles; only an account reset clears it. */
-internal class SharedPreferencesNewznabStateStorage(context: Context) : NewznabStateStorage {
-    private val preferences = context.getSharedPreferences("usenet_indexer_state", Context.MODE_PRIVATE)
-
-    override fun load(): String? = preferences.getString(KEY, null)
-    override fun save(value: String) { preferences.edit().putString(KEY, value).apply() }
-    @Volatile override var generation = 0
-        private set
-
-    fun clear() {
-        preferences.edit().clear().apply()
-        generation += 1
-    }
-
-    private companion object { const val KEY = "indexers" }
 }
 
 @Serializable
@@ -53,6 +37,7 @@ internal data class NewznabIndexerState(
  */
 internal class NewznabIndexerStates(private val storage: NewznabStateStorage, private val now: () -> Long) {
     private val json = Json { ignoreUnknownKeys = true }
+    private val lock = SynchronizedObject()
     private var loaded: MutableMap<String, NewznabIndexerState>? = null
     private var loadedGeneration = 0
 
@@ -68,11 +53,9 @@ internal class NewznabIndexerStates(private val storage: NewznabStateStorage, pr
     /** Increments on every change, so settings can show statuses that searches update. */
     val revision: StateFlow<Int> = changes.asStateFlow()
 
-    @Synchronized
-    fun get(indexer: UsenetIndexer): NewznabIndexerState? = states[key(indexer)]
+    fun get(indexer: UsenetIndexer): NewznabIndexerState? = synchronized(lock) { states[key(indexer)] }
 
-    @Synchronized
-    fun update(indexer: UsenetIndexer, change: (NewznabIndexerState) -> NewznabIndexerState) {
+    fun update(indexer: UsenetIndexer, change: (NewznabIndexerState) -> NewznabIndexerState) = synchronized(lock) {
         val key = key(indexer)
         states[key] = change(states[key] ?: NewznabIndexerState()).copy(touchedAt = now())
         // Deleted or edited indexers stop being touched; forget them and bound the size.

@@ -1,6 +1,6 @@
 package com.nuvio.app.features.usenet
 
-import java.io.IOException
+import kotlinx.io.IOException
 
 /** Control-plane failures only; media errors still use the player's recovery ladder. */
 internal class UsenetPreparationException(

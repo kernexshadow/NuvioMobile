@@ -1,53 +1,85 @@
 package com.nuvio.app.features.usenet
 
-import android.content.Context
-import android.net.Uri
-import android.os.SystemClock
-import android.util.Base64
-import android.util.Log
+import co.touchlab.kermit.Logger
 import com.nuvio.app.features.streams.StreamItem
 import com.nuvio.app.features.streams.StreamSubtitle
-import java.io.File
-import java.io.IOException
-import java.io.InputStream
-import java.security.KeyStore
-import java.security.SecureRandom
-import java.util.concurrent.Executors
-import java.util.concurrent.TimeUnit
-import javax.net.ssl.TrustManagerFactory
-import javax.net.ssl.X509TrustManager
-import kotlin.coroutines.coroutineContext
-import kotlin.coroutines.resume
-import kotlin.coroutines.resumeWithException
+import com.nuvio.app.features.streams.epochMs
+import io.ktor.client.plugins.timeout
+import io.ktor.client.request.get
+import io.ktor.client.request.header
+import io.ktor.client.request.request
+import io.ktor.client.request.setBody
+import io.ktor.client.statement.bodyAsText
+import io.ktor.http.ContentType
+import io.ktor.http.HttpMethod
+import io.ktor.http.content.TextContent
+import io.ktor.http.encodeURLParameter
+import io.ktor.http.isSuccess
+import kotlin.concurrent.Volatile
+import kotlin.time.TimeSource
+import kotlin.uuid.ExperimentalUuidApi
+import kotlin.uuid.Uuid
+import kotlinx.atomicfu.locks.SynchronizedObject
+import kotlinx.atomicfu.locks.synchronized
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.IO
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.SupervisorJob
+import kotlinx.coroutines.currentCoroutineContext
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.ensureActive
 import kotlinx.coroutines.launch
-import kotlinx.coroutines.suspendCancellableCoroutine
 import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock
 import kotlinx.coroutines.withContext
 import kotlinx.coroutines.withTimeoutOrNull
-import okhttp3.Call
-import okhttp3.Callback
-import okhttp3.MediaType.Companion.toMediaType
-import okhttp3.OkHttpClient
-import okhttp3.Request
-import okhttp3.RequestBody.Companion.toRequestBody
-import okhttp3.Response
-import org.json.JSONArray
-import org.json.JSONObject
+import kotlinx.io.IOException
+import kotlinx.serialization.json.Json
+import kotlinx.serialization.json.JsonArray
+import kotlinx.serialization.json.JsonObject
+import kotlinx.serialization.json.JsonPrimitive
+import kotlinx.serialization.json.buildJsonObject
+import kotlinx.serialization.json.int
+import kotlinx.serialization.json.jsonObject
+import kotlinx.serialization.json.jsonPrimitive
+import kotlinx.serialization.json.long
+import kotlinx.serialization.json.put
+import kotlinx.serialization.json.putJsonObject
 
 /**
- * Executes the APK-installed PIE engine from nativeLibraryDir. All media remains in the child.
+ * Runs the engine for [UsenetSidecar]: a child process on Android, a library inside the app on iOS,
+ * where an app cannot start one. Either way the engine serves its loopback HTTP API.
+ */
+internal interface UsenetEngineHost {
+    /** Where the engine keeps downloaded NZBs. */
+    val nzbCacheDir: String
+
+    /** PEM certificates the engine is to trust; empty when it reads the system's itself. */
+    fun certificates(): List<String>
+
+    /**
+     * Starts the engine with [bootstrap], the record it reads at startup, and returns its readiness
+     * record, {"protocol":1,"port":N}. Throws when it does not start; [mark] names startup steps.
+     * Blocks the calling thread.
+     */
+    fun start(bootstrap: String, mark: (String) -> Unit): String
+
+    fun isRunning(): Boolean
+
+    /** Stops the engine; its sessions and sockets go with it. */
+    fun stop()
+
+    fun clearNzbCache()
+}
+
+/**
+ * Opens Usenet streams in the engine and owns its sessions. All media remains in the engine.
  * Provider secrets only cross an authenticated loopback control request.
  */
 internal class UsenetSidecar(
-    private val context: Context,
+    private val host: UsenetEngineHost,
     private val settings: () -> UsenetConfiguration,
     private val unplayable: UnplayableReleases,
     /** Counts NZB downloads, outcomes and what each provider did; null in unit tests that do not look. */
@@ -55,9 +87,7 @@ internal class UsenetSidecar(
 ) {
     private val mutex = Mutex()
     private val cleanup = CoroutineScope(SupervisorJob() + Dispatchers.IO)
-    private val http = OkHttpClient.Builder().connectTimeout(10, TimeUnit.SECONDS)
-        .readTimeout(120, TimeUnit.SECONDS).callTimeout(150, TimeUnit.SECONDS).build()
-    private var process: Process? = null
+    private val http = createUsenetHttpClient(socketTimeoutMillis = 120_000, requestTimeoutMillis = 150_000)
     private var processProfile: String? = null
     private var endpoint: String? = null
     private var token: String? = null
@@ -72,7 +102,7 @@ internal class UsenetSidecar(
     /** By session id; the engine reports each session's providers when it closes. Guarded by mutex. */
     private val sessionStats = mutableMapOf<String, SessionStats>()
     private var retirementJob: Job? = null
-    private val preparationGuard = Any()
+    private val preparationGuard = SynchronizedObject()
     private var preparationJob: Job? = null
     private var preparationOwner: Any? = null
     private var preparationKey: PreparationKey? = null
@@ -98,43 +128,42 @@ internal class UsenetSidecar(
     }
 
     /** The release each recent engine URL plays, so playback outcomes reach its entry. */
-    private val playing = object : LinkedHashMap<String, StreamItem>(8, 0.75f, true) {
-        override fun removeEldestEntry(eldest: MutableMap.MutableEntry<String, StreamItem>) = size > 8
-    }
+    private val playingLock = SynchronizedObject()
+    private val playing = LruMap<String, StreamItem>(8)
 
     /** Open timings by engine URL, logged once the first frame shows. */
-    private val traces = object : LinkedHashMap<String, Trace>(8, 0.75f, true) {
-        override fun removeEldestEntry(eldest: MutableMap.MutableEntry<String, Trace>) = size > 4
-    }
+    private val tracesLock = SynchronizedObject()
+    private val traces = LruMap<String, Trace>(4)
 
     private class Trace(val fast: Boolean, val fastNzb: Boolean) {
-        val start = SystemClock.elapsedRealtime()
-        val recordedAt = System.currentTimeMillis()
-        val marks = JSONObject()
-        var engine: JSONObject = JSONObject()
-        @Synchronized fun mark(name: String) {
-            if (!marks.has(name)) marks.put(name, SystemClock.elapsedRealtime() - start)
+        private val lock = SynchronizedObject()
+        private val start = TimeSource.Monotonic.markNow()
+        val recordedAt = epochMs()
+        private val marks = LinkedHashMap<String, Long>()
+        var engine: JsonObject = JsonObject(emptyMap())
+
+        fun mark(name: String) = synchronized(lock) {
+            if (name !in marks) marks[name] = start.elapsedNow().inWholeMilliseconds
         }
-        @Synchronized fun value(name: String, value: Long) {
-            if (!marks.has(name)) marks.put(name, value)
+
+        fun value(name: String, value: Long) = synchronized(lock) {
+            if (name !in marks) marks[name] = value
         }
+
+        fun marksJson(): JsonObject = synchronized(lock) { JsonObject(marks.mapValues { JsonPrimitive(it.value) }) }
     }
 
     /** The player reached step [name] with the engine URL [url]; only its first time counts. */
     fun markStartup(url: String, name: String) {
-        synchronized(traces) { traces[url] }?.mark(name)
+        synchronized(tracesLock) { traces[url] }?.mark(name)
     }
 
     /** A measured [value] for the startup of [url], such as how long the video decoder took to set up. */
     fun markStartupValue(url: String, name: String, value: Long) {
-        synchronized(traces) { traces[url] }?.value(name, value)
+        synchronized(tracesLock) { traces[url] }?.value(name, value)
     }
 
-    private val startupReader = Executors.newCachedThreadPool { runnable ->
-        Thread(runnable, "usenet-sidecar-io").apply { isDaemon = true }
-    }
-
-    /** Shares the session mutex so launch and Play cannot start duplicate children. */
+    /** Shares the session mutex so launch and Play cannot start duplicate engines. */
     fun prewarm(): Job = cleanup.launch {
         mutex.withLock {
             if (sessionId != null) return@withLock
@@ -257,9 +286,9 @@ internal class UsenetSidecar(
                 }
             }
             val cached = preparedStream
-            if (cached != null && preparedKey == key && process?.let(::isRunning) == true) {
+            if (cached != null && preparedKey == key && host.isRunning()) {
                 clearPreparedLocked()
-                cached.url?.let { url -> synchronized(traces) { traces[url] }?.mark("prepared_session_reused") }
+                cached.url?.let { url -> synchronized(tracesLock) { traces[url] }?.mark("prepared_session_reused") }
                 return@withLock cached
             }
             if (preparedStream != null) releaseSessionLocked()
@@ -287,20 +316,20 @@ internal class UsenetSidecar(
             start(trace)
             previousId = sessionId
             trace.mark("engine_ready")
-            val request = JSONObject().apply {
+            val request = buildJsonObject {
                 put("keepSessionId", previousId ?: "")
                 // The NZB URL carries the indexer key, so profiles of one account share its cache
                 // entry and a profile switch does not download it again.
                 put("cacheScope", "unscoped")
                 put("legacyCacheScope", profileId?.toString() ?: "unscoped")
                 put("nzbUrl", stream.nzbUrl)
-                put("servers", JSONArray(stream.nzbServers))
+                put("servers", JsonArray(stream.nzbServers.map(::JsonPrimitive)))
                 stream.fileIdx?.let { put("fileIdx", it) }
                 stream.fileMustInclude?.let { put("fileMustInclude", it) }
                 season?.let { put("season", it) }
                 episode?.let { put("episode", it) }
-                put("headers", JSONObject(nzbHeaders(stream, configuration)))
-                put("config", JSONObject().apply {
+                put("headers", JsonObject(nzbHeaders(stream, configuration).mapValues { JsonPrimitive(it.value) }))
+                putJsonObject("config") {
                     put("profile", configuration.profile)
                     put("readAhead", configuration.readAhead)
                     put("maxConnections", configuration.maxConnections)
@@ -311,30 +340,29 @@ internal class UsenetSidecar(
                     put("holeFilling", configuration.holeFilling)
                     put("maxMissingArticles", configuration.maxMissingArticles)
                     put("maxConsecutiveMissing", configuration.maxConsecutiveMissing)
-                })
+                }
             }
             trace.mark("session_request")
-            val result = JSONObject(control("/sessions", request))
+            val result = Json.parseToJsonElement(control("/sessions", request)).jsonObject
             trace.mark("session_response")
-            val newId = result.getString("id")
-            val newPath = result.getString("path")
+            val newId = result.getValue("id").jsonPrimitive.content
+            val newPath = result.getValue("path").jsonPrimitive.content
             require(newId.matches(Regex("[0-9a-f]{48}")) && newPath.startsWith("/stream/$newId/"))
             openedId = newId
             // The engine reconciled abandoned sessions before this open.
             retiredSessions.clear()
             val engineUrl = requireNotNull(endpoint)
             val url = UsenetEngineUrls.stream(engineUrl, newId, newPath)
-            val nativeSubtitles = result.optJSONArray("subtitles")?.let { items ->
-                (0 until items.length()).map { index ->
-                    val item = items.getJSONObject(index)
-                    val subtitleId = item.getString("id")
-                    require(subtitleId.toIntOrNull() != null)
-                    StreamSubtitle(
-                        url = "$engineUrl/subtitle/$newId/$subtitleId/${Uri.encode(item.getString("filename"))}",
-                        language = item.optString("lang", "und"),
-                        name = item.optString("filename").takeIf { it.isNotBlank() },
-                    )
-                }
+            val nativeSubtitles = (result["subtitles"] as? JsonArray)?.map { element ->
+                val item = element.jsonObject
+                val subtitleId = item.getValue("id").jsonPrimitive.content
+                require(subtitleId.toIntOrNull() != null)
+                val filename = item.optString("filename")
+                StreamSubtitle(
+                    url = "$engineUrl/subtitle/$newId/$subtitleId/${filename.encodeURLParameter()}",
+                    language = item.optString("lang", "und"),
+                    name = filename.takeIf { it.isNotBlank() },
+                )
             }.orEmpty()
             trace.mark("resolved")
             // The NZB stays as the stream's identity; with a URL it is no longer prepared again.
@@ -347,21 +375,21 @@ internal class UsenetSidecar(
                 externalSubtitles = stream.externalSubtitles + nativeSubtitles,
                 behaviorHints = stream.behaviorHints.copy(
                     proxyHeaders = null,
-                    filename = result.getString("filename"),
-                    videoSize = result.getLong("size"),
+                    filename = result.getValue("filename").jsonPrimitive.content,
+                    videoSize = result.getValue("size").jsonPrimitive.long,
                 ),
             )
             // Validate the entire response before replacing a working session.
-            coroutineContext.ensureActive()
+            currentCoroutineContext().ensureActive()
             sessionId = newId
             playbackUrl = url
             sessionStats[newId] = SessionStats(stream.nzbServers, if (episode != null) ContentKind.SHOW else ContentKind.MOVIE)
-            synchronized(playing) { playing[url] = stream }
-            trace.engine = result.optJSONObject("startup") ?: JSONObject()
+            synchronized(playingLock) { playing[url] = stream }
+            trace.engine = result["startup"] as? JsonObject ?: JsonObject(emptyMap())
             // Only an NZB the engine says it fetched counts as a download from the indexer.
-            val nzbLookup = trace.engine.optJSONObject("nzbCache")?.optString("lookup")
+            val nzbLookup = (trace.engine["nzbCache"] as? JsonObject)?.optString("lookup")
             if (nzbLookup == "miss" || nzbLookup == "disabled") stats?.grabbed(stream.nzbUrl)
-            synchronized(traces) { traces[url] = trace }
+            synchronized(tracesLock) { traces[url] = trace }
             previousId?.let(::retireSessionLocked)
             resolved
         } catch (e: Exception) {
@@ -379,11 +407,13 @@ internal class UsenetSidecar(
                 }
             }
             if (e !is CancellationException) runCatching {
-                Log.i("UsenetPrepare", "open failed source=\"${stream.name}\" release=\"${stream.title?.lineSequence()?.firstOrNull()}\" " +
-                    "kind=${(e as? UsenetPreparationException)?.failure ?: "-"} error=${e.javaClass.simpleName}: " +
-                    redacted(e.message.orEmpty()))
+                Logger.withTag("UsenetPrepare").i {
+                    "open failed source=\"${stream.name}\" release=\"${stream.title?.lineSequence()?.firstOrNull()}\" " +
+                        "kind=${(e as? UsenetPreparationException)?.failure ?: "-"} error=${e::class.simpleName}: " +
+                        redacted(e.message.orEmpty())
+                }
             }
-            if (previousId != null && sessionId == previousId && process?.let(::isRunning) == true) {
+            if (previousId != null && sessionId == previousId && host.isRunning()) {
                 openedId?.let(::retireSessionLocked)
             } else {
                 stopLocked()
@@ -419,36 +449,42 @@ internal class UsenetSidecar(
 
     /** The release behind [url] showed its first frame: remember it, and log how the open went. */
     fun firstFrame(url: String) {
-        synchronized(playing) { playing[url] }?.let {
+        synchronized(playingLock) { playing[url] }?.let {
             unplayable.recordPlayed(it)
             stats?.played(it.nzbUrl)
         }
-        val trace = synchronized(traces) { traces.remove(url) } ?: return
+        val trace = synchronized(tracesLock) { traces.remove(url) } ?: return
         trace.mark("first_frame")
         cleanup.launch {
             val engine = mutex.withLock {
                 val id = sessionId?.takeIf { url == playbackUrl } ?: return@withLock null
                 runCatching {
-                    val request = Request.Builder().url("$endpoint/sessions/$id/diagnostics")
-                        .header("Authorization", "Bearer $token").get().build()
                     // Diagnostics are optional and this holds the session lock: never wait long.
-                    http.newBuilder().callTimeout(5, TimeUnit.SECONDS).build().newCall(request).execute().use { response ->
-                        if (response.isSuccessful) JSONObject(response.body!!.string()) else null
+                    val response = http.get("$endpoint/sessions/$id/diagnostics") {
+                        header("Authorization", "Bearer $token")
+                        timeout { requestTimeoutMillis = 5_000 }
                     }
+                    if (response.status.isSuccess()) Json.parseToJsonElement(response.bodyAsText()).jsonObject else null
                 }.getOrNull()
             } ?: trace.engine
+            val marks = trace.marksJson()
             runCatching {
-                Log.i("UsenetStartup", JSONObject().put("marksMs", trace.marks)
-                    .put("engineMarksMs", engine.optJSONObject("marksMs")).toString())
+                Logger.withTag("UsenetStartup").i {
+                    buildJsonObject {
+                        put("marksMs", marks)
+                        engine["marksMs"]?.let { put("engineMarksMs", it) }
+                    }.toString()
+                }
             }
             runCatching {
                 UsenetStartupReports.save(
-                    JSONObject().put("fastMkvStartup", trace.fast)
-                        .put("fastNzbFetch", trace.fastNzb)
-                        .put("recordedAtMs", trace.recordedAt)
-                        .put("marksMs", trace.marks)
-                        .put("engine", engine)
-                        .toString(),
+                    buildJsonObject {
+                        put("fastMkvStartup", trace.fast)
+                        put("fastNzbFetch", trace.fastNzb)
+                        put("recordedAtMs", trace.recordedAt)
+                        put("marksMs", marks)
+                        put("engine", engine)
+                    }.toString(),
                 )
             }
         }
@@ -456,7 +492,7 @@ internal class UsenetSidecar(
 
     /** Playback of [url] failed with the engine's [failure] kind; repeatable kinds are remembered. */
     fun playbackFailed(url: String, failure: String?) {
-        synchronized(playing) { playing[url] }?.let {
+        synchronized(playingLock) { playing[url] }?.let {
             unplayable.record(it, failure)
             if (failure in UnplayableReleases.KINDS) stats?.unavailable(it.nzbUrl)
         }
@@ -512,118 +548,85 @@ internal class UsenetSidecar(
         return cleanup.launch {
             invalidation.join()
             mutex.withLock {
-                if (!settings().cacheNzb) File(context.cacheDir, NZB_CACHE_DIR).listFiles()?.forEach { it.delete() }
+                if (!settings().cacheNzb) runCatching { host.clearNzbCache() }
             }
             prewarm().join()
         }
     }
 
+    @OptIn(ExperimentalUuidApi::class)
     private fun start(trace: Trace? = null) {
         idleStop?.cancel(); idleStop = null
         val cfg = settings()
         // A settings change must not restart the engine underneath the playing source while its
         // replacement is still being prepared. The new memory target applies once no session owns it.
-        if (process?.let(::isRunning) == true && endpoint != null &&
+        if (host.isRunning() && endpoint != null &&
             (processProfile == cfg.profile || sessionId != null)) {
             trace?.mark("sidecar_reused")
             return
         }
         trace?.mark("sidecar_starting")
         stopLocked()
-        val binary = File(context.applicationInfo.nativeLibraryDir, "libnuvio_usenet.so")
-        if (!binary.canExecute()) {
-            throw UsenetPreparationException("The Usenet engine is missing from this build.", UsenetPreparationException.Scope.ENGINE)
-        }
-        val secret = ByteArray(32).also { SecureRandom().nextBytes(it) }
-            .joinToString("") { "%02x".format(it) }
-        // Go defaults to MADV_FREE on Android, so memory the engine returns after a session stays
-        // in its RSS until the kernel is under pressure. GODEBUG is read before main, hence set here.
-        val child = ProcessBuilder(binary.absolutePath)
-            .apply { environment()["GODEBUG"] = "madvdontneed=1" }
-            .start()
-        trace?.mark("sidecar_spawned")
-        process = child
-        processProfile = cfg.profile
-        startupReader.execute { drainQuietly(child.errorStream) }
-        val bootstrap = JSONObject().apply {
+        // From the platform's secure random generator.
+        val secret = Uuid.random().toHexString() + Uuid.random().toHexString()
+        val bootstrap = buildJsonObject {
             put("token", secret)
-            put("nzbCacheDir", File(context.cacheDir, NZB_CACHE_DIR).absolutePath)
+            put("nzbCacheDir", host.nzbCacheDir)
             put("memoryMiB", when (cfg.profile) {
                 UsenetConfiguration.PROFILE_LOW_MEMORY -> 96
                 UsenetConfiguration.PROFILE_THROUGHPUT -> 224
                 else -> 144
             })
-            // Go cannot consistently locate Android's APEX trust store across OS versions.
-            // Export the system trust manager's public CA certificates.
-            val tmf = TrustManagerFactory.getInstance(TrustManagerFactory.getDefaultAlgorithm())
-            tmf.init(null as KeyStore?)
-            val certs = (tmf.trustManagers.first { it is X509TrustManager } as X509TrustManager).acceptedIssuers
-            put("certificates", JSONArray(certs.map { cert ->
-                "-----BEGIN CERTIFICATE-----\n" + Base64.encodeToString(cert.encoded, Base64.NO_WRAP) + "\n-----END CERTIFICATE-----\n"
-            }))
-        }
-        // Keep stdin open until stopLocked. Parent death closes the pipe and causes the Go process
-        // to terminate even if nothing else ran.
-        child.outputStream.write((bootstrap.toString() + "\n").toByteArray())
-        child.outputStream.flush()
-        trace?.mark("sidecar_bootstrap_sent")
-        val ready = startupReader.submit<String> {
-            child.inputStream.bufferedReader().readLine() ?: throw IOException("Usenet engine exited before startup")
-        }
+            put("certificates", JsonArray(host.certificates().map(::JsonPrimitive)))
+        }.toString()
         try {
-            val record = JSONObject(ready.get(15, TimeUnit.SECONDS))
-            require(record.getInt("protocol") == 1)
-            val port = record.getInt("port"); require(port in 1..65535)
+            processProfile = cfg.profile
+            val record = Json.parseToJsonElement(host.start(bootstrap) { trace?.mark(it) }).jsonObject
+            require(record.getValue("protocol").jsonPrimitive.int == 1)
+            val port = record.getValue("port").jsonPrimitive.int; require(port in 1..65535)
             endpoint = "http://127.0.0.1:$port"; token = secret
             UsenetEngineUrls.remember(port)
             trace?.mark("sidecar_ready")
+        } catch (e: UsenetPreparationException) {
+            stopLocked()
+            throw e
         } catch (_: Exception) {
-            ready.cancel(true)
             stopLocked()
             throw UsenetPreparationException("The Usenet engine could not start.", UsenetPreparationException.Scope.ENGINE)
         }
     }
 
-    private suspend fun control(path: String, payload: JSONObject?, delete: Boolean = false): String {
-        val request = Request.Builder().url("$endpoint$path").header("Authorization", "Bearer $token")
-        if (delete) request.delete() else request.post(payload.toString().toRequestBody("application/json".toMediaType()))
-        val call = http.newCall(request.build())
-        return suspendCancellableCoroutine { continuation ->
-            continuation.invokeOnCancellation { call.cancel() }
-            call.enqueue(object : Callback {
-                override fun onFailure(call: Call, e: IOException) {
-                    if (continuation.isActive) continuation.resumeWithException(
-                        UsenetPreparationException("Could not reach the Usenet engine.", UsenetPreparationException.Scope.ENGINE),
-                    )
-                }
-
-                override fun onResponse(call: Call, response: Response) {
-                    try {
-                        response.use {
-                            val text = it.body?.string().orEmpty()
-                            if (!continuation.isActive) return
-                            if (it.isSuccessful) {
-                                continuation.resume(text)
-                            } else {
-                                val failure = it.header("X-Usenet-Failure")
-                                val scope = when (failure) {
-                                    "configuration" -> UsenetPreparationException.Scope.ENGINE
-                                    "provider" -> UsenetPreparationException.Scope.PROVIDER
-                                    // Busy can be the previous cancelled open still unwinding.
-                                    else -> UsenetPreparationException.Scope.SOURCE
-                                }
-                                continuation.resumeWithException(UsenetPreparationException(
-                                    text.take(240).ifBlank { "The Usenet engine answered HTTP ${it.code}." }, scope, failure,
-                                    providers = it.header("X-Usenet-Providers"),
-                                ))
-                            }
-                        }
-                    } catch (_: IOException) {
-                        if (continuation.isActive) continuation.resumeWithException(IOException("The Usenet engine stopped answering."))
-                    }
-                }
-            })
+    private suspend fun control(path: String, payload: JsonObject?, delete: Boolean = false): String {
+        val response = try {
+            http.request("$endpoint$path") {
+                method = if (delete) HttpMethod.Delete else HttpMethod.Post
+                header("Authorization", "Bearer $token")
+                if (!delete) setBody(TextContent(payload.toString(), ContentType.Application.Json))
+            }
+        } catch (e: CancellationException) {
+            throw e
+        } catch (_: Exception) {
+            throw UsenetPreparationException("Could not reach the Usenet engine.", UsenetPreparationException.Scope.ENGINE)
         }
+        val text = try {
+            response.bodyAsText()
+        } catch (e: CancellationException) {
+            throw e
+        } catch (_: Exception) {
+            throw IOException("The Usenet engine stopped answering.")
+        }
+        if (response.status.isSuccess()) return text
+        val failure = response.headers["X-Usenet-Failure"]
+        val scope = when (failure) {
+            "configuration" -> UsenetPreparationException.Scope.ENGINE
+            "provider" -> UsenetPreparationException.Scope.PROVIDER
+            // Busy can be the previous cancelled open still unwinding.
+            else -> UsenetPreparationException.Scope.SOURCE
+        }
+        throw UsenetPreparationException(
+            text.take(240).ifBlank { "The Usenet engine answered HTTP ${response.status.value}." }, scope, failure,
+            providers = response.headers["X-Usenet-Providers"],
+        )
     }
 
     private fun stopLocked() {
@@ -633,18 +636,8 @@ internal class UsenetSidecar(
         // A stopped engine reports nothing more for its sessions.
         sessionStats.clear()
         idleStop?.cancel(); idleStop = null
-        val child = process
-        process = null; processProfile = null; endpoint = null; token = null; sessionId = null; playbackUrl = null
-        if (child != null) {
-            runCatching { child.outputStream.close() }
-            // Process.isAlive and timed waitFor require API 26; Android destroy sends SIGKILL.
-            runCatching {
-                val deadline = SystemClock.elapsedRealtime() + 2000
-                while (isRunning(child) && SystemClock.elapsedRealtime() < deadline) SystemClock.sleep(20)
-                if (isRunning(child)) child.destroy()
-            }
-            runCatching { child.inputStream.close() }; runCatching { child.errorStream.close() }
-        }
+        processProfile = null; endpoint = null; token = null; sessionId = null; playbackUrl = null
+        runCatching { host.stop() }
     }
 
     companion object {
@@ -656,18 +649,8 @@ internal class UsenetSidecar(
 
         @Volatile var appForeground = true
 
-        private fun isRunning(child: Process): Boolean =
-            try { child.exitValue(); false } catch (_: IllegalThreadStateException) { true }
-
-        /**
-         * Reads the engine's stderr until it ends, keeping none of it: no credentials in Android logs.
-         * Stopping the engine closes the stream under this read, which then throws.
-         */
-        internal fun drainQuietly(input: InputStream) {
-            try {
-                input.use { val bytes = ByteArray(4096); while (it.read(bytes) >= 0) Unit }
-            } catch (_: IOException) {
-            }
-        }
+        /** As org.json's optString: the value as text, or [fallback] when it is absent. */
+        private fun JsonObject.optString(name: String, fallback: String = ""): String =
+            (this[name] as? JsonPrimitive)?.content ?: fallback
     }
 }

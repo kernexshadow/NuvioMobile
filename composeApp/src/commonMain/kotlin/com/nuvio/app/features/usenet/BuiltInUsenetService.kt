@@ -1,14 +1,11 @@
 package com.nuvio.app.features.usenet
 
-import android.util.Log
+import co.touchlab.kermit.Logger
 import com.nuvio.app.features.streams.AddonStreamGroup
 import com.nuvio.app.features.streams.StreamBadge
 import com.nuvio.app.features.streams.StreamBehaviorHints
 import com.nuvio.app.features.streams.StreamItem
-import java.text.DateFormat
-import java.util.Date
-import java.util.Locale
-import java.util.concurrent.atomic.AtomicReference
+import com.nuvio.app.features.streams.epochMs
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.CoroutineStart
 import kotlinx.coroutines.async
@@ -17,6 +14,7 @@ import kotlinx.coroutines.channels.ChannelResult
 import kotlinx.coroutines.coroutineScope
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.Flow
+import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.flow
 import kotlinx.coroutines.joinAll
 import kotlinx.coroutines.launch
@@ -91,16 +89,16 @@ internal class BuiltInUsenetService(
             val servers = config.servers()
             // Each season's episode count lets season packs be filtered and sorted by their size per
             // episode. It is asked of TMDB once the first pack shows up, and the list never waits for it.
-            val seasonEpisodes = AtomicReference<Map<Int, Int>?>(null)
+            val seasonEpisodes = MutableStateFlow<Map<Int, Int>?>(null)
             val seasonLookup = if (!series) null else launch(start = CoroutineStart.LAZY) {
                 val counts = withTimeoutOrNull(SEASON_LOOKUP_TIMEOUT_MS) {
                     try { metadata.seasonEpisodes(request.tmdbId, videoId) }
                     catch (e: CancellationException) { throw e }
                     catch (_: Exception) { null }
                 }
-                seasonEpisodes.set(counts)
+                seasonEpisodes.value = counts
             }
-            fun seasonCounts(): Map<Int, Int>? = seasonEpisodes.get()
+            fun seasonCounts(): Map<Int, Int>? = seasonEpisodes.value
             fun posted(release: UsenetRelease) = release.publishedAt.takeIf { it > 0 }
             // Each release's outcome is looked up once per list, by nzbUrl.
             fun outcomes(): Map<String, ListedOutcome> = releases.associate {
@@ -153,9 +151,9 @@ internal class BuiltInUsenetService(
                     }
                 }
                 launch { jobs.joinAll(); results.close() }
-                val tierStarted = System.currentTimeMillis()
+                val tierStarted = epochMs()
                 fun log(message: String) = runCatching {
-                    Log.i("UsenetSearch", "${System.currentTimeMillis() - tierStarted}ms $message")
+                    Logger.withTag("UsenetSearch").i { "${epochMs() - tierStarted}ms $message" }
                 }
                 suspend fun show(loading: Boolean) {
                     val outcomes = outcomes()
@@ -189,7 +187,7 @@ internal class BuiltInUsenetService(
                     }
                     if (event === SEASON_COUNTED) {
                         lookupShown = true
-                        if (!waiting && seasonEpisodes.get() != null) show(loading = true)
+                        if (!waiting && seasonEpisodes.value != null) show(loading = true)
                         continue
                     }
                     @Suppress("UNCHECKED_CAST")
@@ -200,10 +198,9 @@ internal class BuiltInUsenetService(
                         // Never display raw exception messages: network/parser errors can contain keys.
                         val cooldown = result.exceptionOrNull() as? IndexerCooldownException
                         emit(UsenetSearchUpdate(failure = if (cooldown != null) {
-                            text.indexerPaused.format(indexer.name,
-                                DateFormat.getTimeInstance(DateFormat.SHORT).format(Date(cooldown.until)))
+                            fillTemplate(text.indexerPaused, indexer.name, UsenetPlatform.clockTime(cooldown.until))
                         } else {
-                            text.indexerFailed.format(indexer.name)
+                            fillTemplate(text.indexerFailed, indexer.name)
                         }))
                     } else {
                         releases += result.getOrThrow()
@@ -266,7 +263,7 @@ internal class BuiltInUsenetService(
         val movie = withTimeoutOrNull(ID_CHECK_WAIT_MS) { metadata() } ?: return releases
         return NewznabProtocol.idResultsOf(movie, releases).also { kept ->
             if (kept.size < releases.size) runCatching {
-                Log.i("UsenetSearch", "${indexer.name}: ${releases.size - kept.size} ID results of another film")
+                Logger.withTag("UsenetSearch").i { "${indexer.name}: ${releases.size - kept.size} ID results of another film" }
             }
         }
     }
@@ -274,19 +271,19 @@ internal class BuiltInUsenetService(
     private fun UsenetRelease.toStream(config: UsenetSourceConfiguration, series: Boolean, groupName: String,
         groupId: String, text: UsenetLabels, failed: Boolean = false, played: Boolean = false, pack: Boolean = false,
         seasonEpisodes: Map<Int, Int>? = null, sibling: SiblingOutcome? = null): StreamItem {
-        fun gb(bytes: Long) = "%.2f GB".format(Locale.ROOT, bytes / (1024.0 * 1024 * 1024))
+        fun gb(bytes: Long) = "${formatDecimal(bytes / (1024.0 * 1024 * 1024), 2)} GB"
         // A pack's size is its seasons', not the episode's that plays: with their episode counts, the
         // size badge shows an episode's share and the details keep the whole size.
         val episodeShare = episodeSize(seasonEpisodes).takeIf { pack && it != size }
         val season = packSeasons.size == 1
         val sizeLabel = if (size <= 0) null else when {
             !pack -> gb(size)
-            episodeShare != null && season -> text.sizeSeasonShare.format(gb(size), gb(episodeShare))
-            episodeShare != null -> text.sizePackShare.format(gb(size), gb(episodeShare))
-            season -> text.sizeSeason.format(gb(size))
-            else -> text.sizePack.format(gb(size))
+            episodeShare != null && season -> fillTemplate(text.sizeSeasonShare, gb(size), gb(episodeShare))
+            episodeShare != null -> fillTemplate(text.sizePackShare, gb(size), gb(episodeShare))
+            season -> fillTemplate(text.sizeSeason, gb(size))
+            else -> fillTemplate(text.sizePack, gb(size))
         }
-        val age = if (publishedAt > 0) "${((System.currentTimeMillis() - publishedAt) / 86400000).coerceAtLeast(0)}d" else null
+        val age = if (publishedAt > 0) "${((epochMs() - publishedAt) / 86400000).coerceAtLeast(0)}d" else null
         val details = listOfNotNull(sizeLabel, age, indexerName).joinToString(" • ")
         val resolutionLabel = when {
             resolution >= 2160 -> "4K"
@@ -347,7 +344,7 @@ internal class BuiltInUsenetService(
          * binge group opens the same release again.
          */
         fun bingeGroup(title: String?, series: Boolean = true): String? {
-            val name = title?.trim()?.lowercase(Locale.ROOT)?.takeIf { it.isNotEmpty() } ?: return null
+            val name = title?.trim()?.lowercase()?.takeIf { it.isNotEmpty() } ?: return null
             if (!series) return "$BINGE_PREFIX|$name"
             val upload = NewznabProtocol.episodeTemplate(name)?.first
                 ?: name.takeIf { NewznabProtocol.packSeasons(it).isNotEmpty() } ?: return null
@@ -400,7 +397,7 @@ internal class BuiltInUsenetService(
         private const val SIBLING_PLAYED_COLOR = "#0AA2C0"
 
         fun siblingBadge(outcome: SiblingOutcome): StreamBadge =
-            label("E%02d %s".format(Locale.ROOT, outcome.episode, if (outcome.failed) "FAILED" else "PLAYED"),
+            label("E${outcome.episode.toString().padStart(2, '0')} ${if (outcome.failed) "FAILED" else "PLAYED"}",
                 if (outcome.failed) SIBLING_FAILED_COLOR else SIBLING_PLAYED_COLOR)
 
         /** Available releases first when chosen, unplayable ones last; the sort applies within each. */

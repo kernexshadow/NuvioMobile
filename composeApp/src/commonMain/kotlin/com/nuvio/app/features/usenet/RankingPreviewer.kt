@@ -1,6 +1,6 @@
 package com.nuvio.app.features.usenet
 
-import java.util.Locale
+import com.nuvio.app.features.streams.epochMs
 
 /** Sorts sample release names with the same engine as real results, for the custom sorting editor. */
 internal object RankingPreviewer {
@@ -9,7 +9,7 @@ internal object RankingPreviewer {
         samples: List<RankingSample>,
         mediaType: String,
         indexerOrder: Map<String, Int> = emptyMap(),
-        now: Long = System.currentTimeMillis(),
+        now: Long = epochMs(),
     ): RankingPreview {
         profile.validate()
         require(mediaType == "movie" || mediaType == "series") { "Choose movies or episodes" }
@@ -24,7 +24,7 @@ internal object RankingPreviewer {
                 value = index,
                 facts = facts,
                 key = index.toString(),
-                indexerOrder = indexerOrder[sample.indexer.lowercase(Locale.ROOT)] ?: Int.MAX_VALUE,
+                indexerOrder = indexerOrder[sample.indexer.lowercase()] ?: Int.MAX_VALUE,
             )
         }
         val results = StreamRankingEngines.get(profile).rank(candidates, now)

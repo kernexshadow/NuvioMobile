@@ -30,7 +30,8 @@ class UsenetSourceStatsTest {
     private var clock = 20_000L * day + 12 * 3600 * 1000
     private var zone: ZoneId = ZoneOffset.UTC
     private val storage = MemoryStatsStorage()
-    private fun stats(storage: UsenetStatsStorage = this.storage) = UsenetSourceStats(storage, { clock }, { zone }) { it.run() }
+    private fun offset(at: Long) = zone.rules.getOffset(java.time.Instant.ofEpochMilli(at)).totalSeconds * 1000L
+    private fun stats(storage: UsenetStatsStorage = this.storage) = UsenetSourceStats(storage, { clock }, ::offset) { it() }
     private val ALL = StatsContent.ALL
 
     @Test fun `requests and searches add up in the day and in total`() {
@@ -202,11 +203,11 @@ class UsenetSourceStatsTest {
     }
 
     @Test fun `a reset writes after any save already queued`() {
-        val queued = mutableListOf<Runnable>()
-        val stats = UsenetSourceStats(storage, { clock }, { zone }) { queued += it }
+        val queued = mutableListOf<() -> Unit>()
+        val stats = UsenetSourceStats(storage, { clock }, ::offset) { queued += it }
         stats.indexerSearch("a", ContentKind.MOVIE, SearchOutcome.ANSWERED, 1)
         stats.reset()
-        queued.forEach { it.run() }
+        queued.forEach { it() }
         assertNull(storage.value)
     }
 

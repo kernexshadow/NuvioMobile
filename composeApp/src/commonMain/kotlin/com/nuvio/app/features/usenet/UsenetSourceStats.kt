@@ -1,19 +1,21 @@
 package com.nuvio.app.features.usenet
 
-import android.content.Context
-import java.net.URI
-import java.net.URLDecoder
-import java.time.Instant
-import java.time.ZoneId
-import java.util.concurrent.Executors
+import com.nuvio.app.features.streams.epochMs
+import io.ktor.http.decodeURLPart
 import kotlin.math.roundToLong
+import kotlinx.atomicfu.locks.SynchronizedObject
+import kotlinx.atomicfu.locks.synchronized
+import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.SupervisorJob
+import kotlinx.coroutines.launch
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.serialization.Serializable
 import kotlinx.serialization.json.Json
 
-/** Where [UsenetSourceStats] persists; the app uses private SharedPreferences. */
+/** Where [UsenetSourceStats] persists; the app uses private platform preferences. */
 internal interface UsenetStatsStorage {
     fun load(): String?
     fun save(value: String)
@@ -23,26 +25,6 @@ internal interface UsenetStatsStorage {
     fun savePreference(name: String, value: String)
     /** Changes when the stored counts are cleared from outside, so a loaded copy is dropped. */
     val generation: Int get() = 0
-}
-
-internal class SharedPreferencesUsenetStatsStorage(context: Context) : UsenetStatsStorage {
-    private val preferences = context.getSharedPreferences("usenet_source_stats", Context.MODE_PRIVATE)
-
-    override fun load(): String? = preferences.getString(KEY, null)
-    override fun save(value: String) { preferences.edit().putString(KEY, value).apply() }
-    override fun clear() { preferences.edit().remove(KEY).commit() }
-    override fun loadPreference(name: String): String? = preferences.getString(name, null)
-    override fun savePreference(name: String, value: String) { preferences.edit().putString(name, value).apply() }
-    @Volatile override var generation = 0
-        private set
-
-    /** An account reset: the counts and the chosen filters go. They hold no credential and are shared by profiles. */
-    fun clearAll() {
-        preferences.edit().clear().commit()
-        generation += 1
-    }
-
-    private companion object { const val KEY = "stats" }
 }
 
 /** Counts split by what they were for; only the parts with events exist. */
@@ -96,13 +78,23 @@ private data class ProviderReport(
  * left out, so a server listed with another password is still the same account.
  */
 internal fun providerAccount(serverUrl: String?): String? {
-    val uri = runCatching { URI(serverUrl ?: return null) }.getOrNull() ?: return null
-    val host = uri.host?.lowercase()?.takeIf { it.isNotEmpty() } ?: return null
-    val port = if (uri.port > 0) uri.port else if (uri.scheme.equals("nntps", ignoreCase = true)) 563 else 119
-    val username = uri.rawUserInfo?.substringBefore(':')
-        ?.let { runCatching { URLDecoder.decode(it.replace("+", "%2B"), "UTF-8") }.getOrDefault(it) }.orEmpty()
-    return "$host:$port\n$username"
+    val text = serverUrl ?: return null
+    val scheme = text.substringBefore("://", "").takeIf { SCHEME_NAME.matches(it) } ?: return null
+    val authority = text.substringAfter("://").substringBefore('/').substringBefore('?').substringBefore('#')
+    val hostAndPort = authority.substringAfterLast('@')
+    val (host, port) = if (hostAndPort.startsWith('[')) {
+        hostAndPort.substringBefore(']') + "]" to hostAndPort.substringAfter("]", "").removePrefix(":")
+    } else {
+        hostAndPort.substringBefore(':') to hostAndPort.substringAfter(':', "")
+    }
+    if (host.isEmpty() || host == "[]" || !isValidHost(host)) return null
+    val portNumber = port.toIntOrNull()?.takeIf { it > 0 } ?: if (scheme.equals("nntps", ignoreCase = true)) 563 else 119
+    val username = authority.substringBeforeLast('@', "").substringBefore(':')
+        .let { runCatching { it.decodeURLPart() }.getOrDefault(it) }
+    return "${host.lowercase()}:$portNumber\n$username"
 }
+
+private val SCHEME_NAME = Regex("[A-Za-z][A-Za-z0-9+.-]*")
 
 /**
  * How each indexer and provider did: searches, requests, NZB downloads and how releases played for
@@ -116,11 +108,13 @@ internal fun providerAccount(serverUrl: String?): String? {
  */
 internal class UsenetSourceStats(
     private val storage: UsenetStatsStorage,
-    private val now: () -> Long = System::currentTimeMillis,
-    private val zone: () -> ZoneId = ZoneId::systemDefault,
+    private val now: () -> Long = ::epochMs,
+    /** The local time zone's offset from UTC at an instant, which sets where days start. */
+    private val offsetMs: (Long) -> Long = UsenetText::localOffsetMs,
     /** Runs saves in order, off the calling thread. */
-    private val background: (Runnable) -> Unit = WRITER::execute,
+    private val background: (() -> Unit) -> Unit = { task -> WRITER.launch { task() } },
 ) {
+    private val lock = SynchronizedObject()
     private val json = Json { ignoreUnknownKeys = true }
     private val changes = MutableStateFlow(0)
 
@@ -149,21 +143,15 @@ internal class UsenetSourceStats(
      */
     private class Attribution(val indexer: String, val kind: ContentKind?, var outcomeAt: Long = Long.MIN_VALUE / 2)
 
-    private val attributions = object : LinkedHashMap<String, Attribution>(64, 0.75f, true) {
-        override fun removeEldestEntry(eldest: MutableMap.MutableEntry<String, Attribution>) = size > MAX_ATTRIBUTIONS
-    }
+    private val attributions = LruMap<String, Attribution>(MAX_ATTRIBUTIONS)
 
     /**
      * Configured providers' ids by server URL and by account, from [knowProviders]. The engine
      * names a session's providers by the URLs it was opened with, which may predate an edit; those
      * stay here, so the session still counts for the edited provider. Memory only: URLs hold passwords.
      */
-    private val providerIds = object : LinkedHashMap<String, String>(16, 0.75f, true) {
-        override fun removeEldestEntry(eldest: MutableMap.MutableEntry<String, String>) = size > MAX_PROVIDER_LINKS
-    }
-    private val accountIds = object : LinkedHashMap<String, String>(16, 0.75f, true) {
-        override fun removeEldestEntry(eldest: MutableMap.MutableEntry<String, String>) = size > MAX_PROVIDER_LINKS
-    }
+    private val providerIds = LruMap<String, String>(MAX_PROVIDER_LINKS)
+    private val accountIds = LruMap<String, String>(MAX_PROVIDER_LINKS)
 
     /** Loaded on first use, and again after an account reset cleared the storage. */
     private val records: Records
@@ -182,12 +170,10 @@ internal class UsenetSourceStats(
         storage.loadPreference(name)?.let { value -> enumValues<E>().firstOrNull { it.name == value } } ?: default
 
     /** Loads the counts and the chosen filters; settings call it off the main thread before reading. */
-    @Synchronized
-    fun load() {
+    fun load(): Unit = synchronized(lock) {
         records
     }
 
-    @Synchronized
     fun indexerRequest(key: String, kind: ContentKind?, outcome: RequestOutcome, elapsedMs: Long = 0) = countIndexer(key, kind) {
         when (outcome) {
             RequestOutcome.ANSWERED -> it.copy(
@@ -199,7 +185,6 @@ internal class UsenetSourceStats(
         }
     }
 
-    @Synchronized
     fun indexerSearch(key: String, kind: ContentKind, outcome: SearchOutcome, releases: Int = 0) = countIndexer(key, kind) {
         when (outcome) {
             SearchOutcome.ANSWERED -> it.copy(
@@ -212,8 +197,7 @@ internal class UsenetSourceStats(
     }
 
     /** The providers as configured, so engine reports, which name servers by URL, count for them. */
-    @Synchronized
-    fun knowProviders(providers: Collection<UsenetProvider>) {
+    fun knowProviders(providers: Collection<UsenetProvider>): Unit = synchronized(lock) {
         providers.forEach { provider ->
             val url = provider.serverUrl()
             providerIds[url] = provider.id
@@ -226,8 +210,7 @@ internal class UsenetSourceStats(
         server?.let { providerIds[it] ?: providerAccount(it)?.let(accountIds::get) }
 
     /** Remembers that [indexerKey] listed these releases, so their downloads and playback count for it. */
-    @Synchronized
-    fun remember(nzbUrls: Collection<String>, indexerKey: String, kind: ContentKind?) {
+    fun remember(nzbUrls: Collection<String>, indexerKey: String, kind: ContentKind?): Unit = synchronized(lock) {
         nzbUrls.forEach { url ->
             if (url.isBlank()) return@forEach
             val known = attributions[url]
@@ -237,21 +220,18 @@ internal class UsenetSourceStats(
     }
 
     /** An NZB was downloaded from the release's indexer. Ignored for a release no search listed. */
-    @Synchronized
-    fun grabbed(nzbUrl: String?) {
+    fun grabbed(nzbUrl: String?): Unit = synchronized(lock) {
         val attribution = nzbUrl?.let { attributions[it] } ?: return
         countIndexer(attribution.indexer, attribution.kind) { it.copy(grabs = it.grabs + 1) }
     }
 
     /** The release showed its first frame. Counted once per release every [OUTCOME_INTERVAL_MS]. */
-    @Synchronized
     fun played(nzbUrl: String?) = outcome(nzbUrl) { it.copy(played = it.played + 1) }
 
     /** The release failed for good. Counted once per release every [OUTCOME_INTERVAL_MS]. */
-    @Synchronized
     fun unavailable(nzbUrl: String?) = outcome(nzbUrl) { it.copy(unavailable = it.unavailable + 1) }
 
-    private fun outcome(nzbUrl: String?, change: (IndexerCounts) -> IndexerCounts) {
+    private fun outcome(nzbUrl: String?, change: (IndexerCounts) -> IndexerCounts): Unit = synchronized(lock) {
         val attribution = nzbUrl?.let { attributions[it] } ?: return
         // Player restarts and decoder switches show the first frame again.
         if (now() - attribution.outcomeAt < OUTCOME_INTERVAL_MS) return
@@ -270,8 +250,7 @@ internal class UsenetSourceStats(
      * compressed archive or a blank release is no provider's failure; a provider that served
      * articles for it still counts them and the session.
      */
-    @Synchronized
-    fun providerSession(servers: List<String>, kind: ContentKind?, body: String, refused: Boolean = false, failure: String? = null) {
+    fun providerSession(servers: List<String>, kind: ContentKind?, body: String, refused: Boolean = false, failure: String? = null): Unit = synchronized(lock) {
         if (body.isBlank()) return
         val providerFailure = refused && failure in PROVIDER_FAILURES
         val reports = runCatching { json.decodeFromString<ProviderReports>(body) }.getOrNull()?.providers ?: return
@@ -306,24 +285,19 @@ internal class UsenetSourceStats(
         changed()
     }
 
-    @Synchronized
     fun indexer(key: String, period: StatsPeriod, content: StatsContent): IndexerCounts? =
-        records.indexers[key]?.counts(period, content, IndexerCounts::plus)
+        synchronized(lock) { records.indexers[key]?.counts(period, content, IndexerCounts::plus) }
 
-    @Synchronized
     fun indexerToday(key: String, content: StatsContent): IndexerCounts? =
-        records.indexers[key]?.days?.get(today())?.select(content, IndexerCounts::plus)
+        synchronized(lock) { records.indexers[key]?.days?.get(today())?.select(content, IndexerCounts::plus) }
 
     /** When the indexer was first counted, or since the last reset. */
-    @Synchronized
-    fun indexerSince(key: String): Long? = records.indexers[key]?.since
+    fun indexerSince(key: String): Long? = synchronized(lock) { records.indexers[key]?.since }
 
-    @Synchronized
     fun provider(key: String, period: StatsPeriod, content: StatsContent): ProviderCounts? =
-        records.providers[key]?.counts(period, content, ProviderCounts::plus)
+        synchronized(lock) { records.providers[key]?.counts(period, content, ProviderCounts::plus) }
 
-    @Synchronized
-    fun providerSince(key: String): Long? = records.providers[key]?.since
+    fun providerSince(key: String): Long? = synchronized(lock) { records.providers[key]?.since }
 
     private fun <T> SourceRecord<T>.counts(period: StatsPeriod, content: StatsContent, plus: (T, T) -> T): T? {
         if (period == StatsPeriod.ALL_TIME) return total.select(content, plus)
@@ -331,8 +305,7 @@ internal class UsenetSourceStats(
         return days.filterKeys { it >= first }.values.mapNotNull { it.select(content, plus) }.reduceOrNull(plus)
     }
 
-    @Synchronized
-    fun setPeriod(period: StatsPeriod) {
+    fun setPeriod(period: StatsPeriod): Unit = synchronized(lock) {
         records
         if (periodState.value == period) return
         periodState.value = period
@@ -340,8 +313,7 @@ internal class UsenetSourceStats(
         changes.value += 1
     }
 
-    @Synchronized
-    fun setContent(content: StatsContent) {
+    fun setContent(content: StatsContent): Unit = synchronized(lock) {
         records
         if (contentState.value == content) return
         contentState.value = content
@@ -350,23 +322,21 @@ internal class UsenetSourceStats(
     }
 
     /** Forgets every count at once; the chosen period and content stay. */
-    @Synchronized
-    fun reset() {
+    fun reset(): Unit = synchronized(lock) {
         records.indexers.clear()
         records.providers.clear()
         dirty = false
         // After any save already queued, so an older copy cannot come back.
-        background(Runnable { storage.clear() })
+        background { storage.clear() }
         changes.value += 1
     }
 
     /** Saves counts that were held back. */
-    @Synchronized
-    fun flush() {
+    fun flush(): Unit = synchronized(lock) {
         if (dirty) save()
     }
 
-    private fun countIndexer(key: String, kind: ContentKind?, change: (IndexerCounts) -> IndexerCounts) {
+    private fun countIndexer(key: String, kind: ContentKind?, change: (IndexerCounts) -> IndexerCounts): Unit = synchronized(lock) {
         records.indexers.add(key, kind, IndexerCounts(), change)
         changed()
     }
@@ -395,19 +365,20 @@ internal class UsenetSourceStats(
         val snapshot = StoredUsenetStats(records.indexers.toMap(), records.providers.toMap())
         dirty = false
         savedAt = at
-        background(Runnable { storage.save(json.encodeToString(StoredUsenetStats.serializer(), snapshot)) })
+        background { storage.save(json.encodeToString(StoredUsenetStats.serializer(), snapshot)) }
     }
 
     /** Deleted sources stop being counted: forget them, bound the size, and drop days past the month. */
     private fun <T> MutableMap<String, SourceRecord<T>>.prune(at: Long, firstDay: Long) {
         entries.removeAll { at - it.value.touchedAt > RETENTION_MS }
         while (size > MAX_SOURCES) remove(minBy { it.value.touchedAt }.key)
-        replaceAll { _, record ->
-            if (record.days.keys.all { it >= firstDay }) record else record.copy(days = record.days.filterKeys { it >= firstDay })
+        for (entry in entries) {
+            val record = entry.value
+            if (record.days.keys.any { it < firstDay }) entry.setValue(record.copy(days = record.days.filterKeys { it >= firstDay }))
         }
     }
 
-    private fun today(): Long = Instant.ofEpochMilli(now()).atZone(zone()).toLocalDate().toEpochDay()
+    private fun today(): Long = now().let { (it + offsetMs(it)).floorDiv(86_400_000L) }
 
     companion object {
         /** How many days are kept per day. */
@@ -425,8 +396,7 @@ internal class UsenetSourceStats(
         internal val PROVIDER_FAILURES = setOf("missing-article", "hole-limit", "invalid-article")
         private const val PERIOD = "period"
         private const val CONTENT = "content"
-        private val WRITER = Executors.newSingleThreadExecutor { runnable ->
-            Thread(runnable, "usenet-stats").apply { isDaemon = true }
-        }
+        /** One task at a time, in the order they were queued. */
+        private val WRITER = CoroutineScope(SupervisorJob() + Dispatchers.Default.limitedParallelism(1))
     }
 }

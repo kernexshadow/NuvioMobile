@@ -1,22 +1,21 @@
 package com.nuvio.app.features.usenet
 
-import java.net.URI
-import java.security.MessageDigest
-import okhttp3.HttpUrl
-import okhttp3.HttpUrl.Companion.toHttpUrlOrNull
+import io.ktor.http.URLBuilder
+import io.ktor.http.Url
+import io.ktor.http.appendPathSegments
 
 /**
  * The Newznab endpoint: [UsenetIndexer.apiUrl] with [UsenetIndexer.apiPath] appended, keeping the
  * URL's query parameters. A URL that already ends with the path is used as is, so a pasted
  * complete endpoint still works.
  */
-internal fun UsenetIndexer.endpointUrl(): HttpUrl? {
-    val url = apiUrl.trim().toHttpUrlOrNull() ?: return null
+internal fun UsenetIndexer.endpointUrl(): Url? {
+    val url = httpUrlOrNull(apiUrl) ?: return null
     val path = apiPath.trim().trim('/')
     if (path.isEmpty()) return url
     val segments = path.split('/')
-    if (url.pathSegments.filter { it.isNotEmpty() }.takeLast(segments.size) == segments) return url
-    return url.newBuilder().addPathSegments(path).build()
+    if (url.segments.takeLast(segments.size) == segments) return url
+    return URLBuilder(url).appendPathSegments(segments).build()
 }
 
 /** [endpointUrl] as text; the URL as entered while it is invalid or has no path to add. */
@@ -27,9 +26,7 @@ internal val UsenetIndexer.endpoint: String
  * What an indexer's state is kept under: a hash of its endpoint and key, so no secret is stored
  * and an edited indexer starts fresh.
  */
-internal fun UsenetIndexer.stateKey(): String = MessageDigest.getInstance("SHA-256")
-    .digest("$endpoint\n$apiKey".toByteArray())
-    .joinToString("") { "%02x".format(it) }
+internal fun UsenetIndexer.stateKey(): String = UsenetText.sha256Hex("$endpoint\n$apiKey")
 
 internal fun UsenetProvider.validate() {
     require(name.isNotBlank() && host.isNotBlank()) { "Name and server host are required" }
@@ -39,7 +36,7 @@ internal fun UsenetProvider.validate() {
     require(!username.contains(':') && !(username + password).contains(Regex("[\\r\\n\\u0000]"))) {
         "Invalid provider credentials"
     }
-    URI(serverUrl()) // Also validates IPv6 and host syntax.
+    require(isValidHost(host)) { "Enter a valid server host" }
 }
 
 internal fun UsenetIndexer.validate() {
@@ -52,7 +49,7 @@ internal fun UsenetIndexer.validate() {
     require(!apiPath.contains(Regex("[?#\\\\\\s]")) && apiPath.split('/').none { it == "." || it == ".." }) {
         "Enter an API path such as /api"
     }
-    require(url.username.isEmpty() && url.password.isEmpty() && url.fragment == null) {
+    require(url.user.isNullOrEmpty() && url.password.isNullOrEmpty() && !apiUrl.contains('#')) {
         "Use an API URL without user credentials or a fragment"
     }
 }

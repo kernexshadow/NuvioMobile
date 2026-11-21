@@ -100,6 +100,3 @@ internal actual object UsenetPlatform {
 
     actual fun clockTime(epochMs: Long): String = ""
 }
-
-internal actual fun isValidRankingPattern(value: String): Boolean =
-    runCatching { Regex(value, RegexOption.IGNORE_CASE) }.isSuccess

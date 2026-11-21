@@ -1,26 +1,35 @@
 package com.nuvio.app.features.usenet
 
-import java.io.IOException
-import java.security.MessageDigest
-import java.time.ZonedDateTime
-import java.time.format.DateTimeFormatter
-import java.util.concurrent.TimeUnit
+import com.nuvio.app.features.streams.epochMs
+import io.ktor.client.HttpClient
+import io.ktor.client.request.get
+import io.ktor.client.request.header
+import io.ktor.client.statement.HttpResponse
+import io.ktor.client.statement.bodyAsChannel
+import io.ktor.http.Headers
+import io.ktor.http.URLBuilder
+import io.ktor.http.Url
+import io.ktor.http.contentLength
+import io.ktor.utils.io.readRemaining
+import kotlin.time.TimeSource
+import kotlinx.atomicfu.locks.SynchronizedObject
+import kotlinx.atomicfu.locks.synchronized
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.async
 import kotlinx.coroutines.coroutineScope
 import kotlinx.coroutines.currentCoroutineContext
 import kotlinx.coroutines.ensureActive
 import kotlinx.coroutines.flow.StateFlow
-import kotlinx.coroutines.suspendCancellableCoroutine
-import okhttp3.Call
-import okhttp3.Callback
-import okhttp3.Headers
-import okhttp3.HttpUrl
-import okhttp3.OkHttpClient
-import okhttp3.Request
-import okhttp3.Response
-import kotlin.coroutines.resume
-import kotlin.coroutines.resumeWithException
+import kotlinx.io.IOException
+import kotlinx.io.readByteArray
+
+/**
+ * The HTTP client Usenet requests use: it follows redirects, connects within 10 s and waits up to
+ * [socketTimeoutMillis] for data and [requestTimeoutMillis] for a whole request. API keys are in
+ * query strings and provider credentials in engine requests, so it has no URL logging, breadcrumbs
+ * or disk cache.
+ */
+internal expect fun createUsenetHttpClient(socketTimeoutMillis: Long = 20_000, requestTimeoutMillis: Long = 25_000): HttpClient
 
 /** Requests to an indexer are paused until [until] because it reported a limit. */
 internal class IndexerCooldownException(val until: Long) : IllegalStateException("Indexer limit reached")
@@ -44,15 +53,11 @@ internal class NewznabClient(
     private val agent: () -> String = { NUVIO_USER_AGENT },
 ) {
 
-    // API keys are in query strings: use a dedicated client without URL logging,
-    // Sentry breadcrumbs or a disk response cache.
-    private val client = OkHttpClient.Builder().connectTimeout(10, TimeUnit.SECONDS)
-        .readTimeout(20, TimeUnit.SECONDS).callTimeout(25, TimeUnit.SECONDS).build()
+    private val client = createUsenetHttpClient()
     private val states = NewznabIndexerStates(storage, ::now)
-    private val seasons = object : LinkedHashMap<String, Pair<Long, List<UsenetRelease>>>(16, 0.75f, true) {
-        override fun removeEldestEntry(eldest: MutableMap.MutableEntry<String, Pair<Long, List<UsenetRelease>>>) =
-            size > MAX_SEASONS
-    }
+    private val seasonsLock = SynchronizedObject()
+    /** Least recently used first. */
+    private val seasons = LinkedHashMap<String, Pair<Long, List<UsenetRelease>>>()
 
     /** Caps cost an API hit on most indexers and rarely change; [live] skips the cache and any cooldown. */
     suspend fun capabilities(indexer: UsenetIndexer, live: Boolean = false): NewznabCapabilities {
@@ -120,7 +125,7 @@ internal class NewznabClient(
         val key = "$url#$results"
         // Keyed by the endpoint and key, which another profile or a renamed indexer can share:
         // reused releases take the asking indexer's id and name, which ordering and deduplication use.
-        synchronized(seasons) { seasons[key] }?.takeIf { now() - it.first < SEASON_TTL_MS }?.let { cached ->
+        synchronized(seasonsLock) { seasons.remove(key)?.also { seasons[key] = it } }?.takeIf { now() - it.first < SEASON_TTL_MS }?.let { cached ->
             return cached.second.map { it.copy(indexerId = indexer.id, indexerName = indexer.name) }
         }
         val releases = try {
@@ -129,7 +134,11 @@ internal class NewznabClient(
         // Some indexers reject season-only searches; remember it so each episode does not retry.
         // Any other failure may pass, so it is not remembered: the next episode asks again.
         catch (e: Exception) { if (isSearchRejection(e)) emptyList() else throw e }
-        synchronized(seasons) { seasons[key] = now() to releases }
+        synchronized(seasonsLock) {
+            seasons.remove(key)
+            seasons[key] = now() to releases
+            if (seasons.size > MAX_SEASONS) seasons.remove(seasons.keys.first())
+        }
         return releases
     }
 
@@ -138,25 +147,24 @@ internal class NewznabClient(
      * leave items out of a page while more follow, so the total they report says whether to ask for
      * the next; without one, a full page does. An empty page ends the search.
      */
-    private suspend fun pages(indexer: UsenetIndexer, url: HttpUrl, request: UsenetSearchRequest,
+    private suspend fun pages(indexer: UsenetIndexer, url: Url, request: UsenetSearchRequest,
         caps: NewznabCapabilities, results: Int, wholeSeason: Boolean = false): List<UsenetRelease> {
         require(results >= 0) { "Invalid fetch limit" }
         val limit = caps.limit.coerceIn(1, 100)
         val kind = if (request.series) ContentKind.SHOW else ContentKind.MOVIE
         val releases = mutableListOf<UsenetRelease>()
         val seenUrls = hashSetOf<String>()
-        val seenPages = hashSetOf<List<Byte>>()
+        val seenPages = hashSetOf<String>()
         var offset = 0
         while (results == 0 || offset < results) {
             currentCoroutineContext().ensureActive()
             val pageSize = if (results == 0) limit else minOf(limit, results - offset)
-            val next = (if (offset == 0) url else
+            val next = URLBuilder(if (offset == 0) url else
                 NewznabProtocol.searchUrl(indexer, request, caps, offset, wholeSeason) ?: break)
-                .newBuilder().setQueryParameter("limit", pageSize.toString()).build()
+                .setQueryParameter("limit", pageSize.toString()).build()
             val answer = try {
                 request(indexer, next, kind = kind) { xml ->
-                    NewznabProtocol.releases(xml, indexer) to
-                        MessageDigest.getInstance("SHA-256").digest(xml.toByteArray()).toList()
+                    NewznabProtocol.releases(xml, indexer) to UsenetText.sha256Hex(xml)
                 }
             } catch (e: CancellationException) { throw e }
             catch (e: Exception) {
@@ -182,17 +190,17 @@ internal class NewznabClient(
      * spend requests that can only fail. Every request sent counts in the indexer's statistics,
      * for [kind] when it searched for one.
      */
-    private suspend fun <T> request(indexer: UsenetIndexer, url: HttpUrl, ignoreCooldown: Boolean = false,
+    private suspend fun <T> request(indexer: UsenetIndexer, url: Url, ignoreCooldown: Boolean = false,
         kind: ContentKind? = null, parse: (String) -> T): T {
         val blockedUntil = states.get(indexer)?.blockedUntil ?: 0
         if (!ignoreCooldown && blockedUntil > now()) throw IndexerCooldownException(blockedUntil)
         fun count(outcome: RequestOutcome, elapsedMs: Long = 0) = stats?.indexerRequest(indexer.id, kind, outcome, elapsedMs)
-        val started = System.nanoTime()
+        val started = TimeSource.Monotonic.markNow()
         val response = try { get(url) }
             catch (e: CancellationException) { throw e }
             catch (e: IOException) { count(RequestOutcome.FAILED); note(indexer, UsenetIndexerProblem.UNREACHABLE); throw e }
             catch (e: Exception) { count(RequestOutcome.FAILED); note(indexer, UsenetIndexerProblem.RESPONSE); throw e }
-        val elapsedMs = (System.nanoTime() - started) / 1_000_000
+        val elapsedMs = started.elapsedNow().inWholeMilliseconds
         val retryAfter = retryAfterMs(response.headers["Retry-After"])
         if (response.code == 429) {
             count(RequestOutcome.LIMITED)
@@ -253,41 +261,38 @@ internal class NewznabClient(
     private fun retryAfterMs(value: String?): Long? {
         val text = value?.trim()?.takeIf { it.isNotEmpty() } ?: return null
         text.toLongOrNull()?.let { return if (it > 0) it * 1000 else null }
-        return runCatching {
-            ZonedDateTime.parse(text, DateTimeFormatter.RFC_1123_DATE_TIME).toInstant().toEpochMilli() - now()
-        }.getOrNull()?.takeIf { it > 0 }
+        return NewznabDates.rfc1123(text)?.minus(now())?.takeIf { it > 0 }
     }
 
-    private fun now() = System.currentTimeMillis()
+    private fun now() = epochMs()
 
     private class IndexerResponse(val code: Int, val headers: Headers, val body: String)
 
-    private suspend fun get(url: HttpUrl): IndexerResponse = suspendCancellableCoroutine { continuation ->
-        val call = client.newCall(Request.Builder().url(url).header(USER_AGENT, agent())
-            .header("Cache-Control", "no-store").build())
-        continuation.invokeOnCancellation { call.cancel() }
-        call.enqueue(object : Callback {
-            override fun onFailure(call: Call, e: IOException) {
-                if (continuation.isActive) continuation.resumeWithException(IOException("Could not reach indexer"))
+    /** Errors never carry the URL, which holds the API key. */
+    private suspend fun get(url: Url): IndexerResponse {
+        val response = try {
+            client.get(url) {
+                header(USER_AGENT, agent())
+                header("Cache-Control", "no-store")
             }
-            override fun onResponse(call: Call, response: Response) {
-                try {
-                    val result = response.use {
-                        val source = it.body?.source() ?: error("Empty indexer response")
-                        source.request(MAX_XML_BYTES + 1)
-                        check(source.buffer.size <= MAX_XML_BYTES) { "Indexer response is too large" }
-                        IndexerResponse(it.code, it.headers, source.readByteArray().toString(Charsets.UTF_8))
-                    }
-                    if (continuation.isActive) continuation.resume(result)
-                } catch (e: Exception) {
-                    if (continuation.isActive) continuation.resumeWithException(e)
-                }
-            }
-        })
+        } catch (e: CancellationException) { throw e }
+        catch (_: IOException) { throw IOException("Could not reach indexer") }
+        catch (_: Exception) { throw IllegalStateException("Indexer request failed") }
+        val body = try { body(response) }
+            catch (e: CancellationException) { throw e }
+            catch (_: IOException) { throw IOException("Could not reach indexer") }
+        return IndexerResponse(response.status.value, response.headers, body)
+    }
+
+    private suspend fun body(response: HttpResponse): String {
+        check((response.contentLength() ?: 0) <= MAX_XML_BYTES) { "Indexer response is too large" }
+        val bytes = response.bodyAsChannel().readRemaining(MAX_XML_BYTES + 1L).readByteArray()
+        check(bytes.size <= MAX_XML_BYTES) { "Indexer response is too large" }
+        return bytes.decodeToString()
     }
 
     private companion object {
-        const val MAX_XML_BYTES = 4L * 1024 * 1024
+        const val MAX_XML_BYTES = 4 * 1024 * 1024
         const val CAPS_TTL_MS = 7L * 24 * 3600 * 1000
         const val THROTTLE_MS = 60_000L
         const val MAX_THROTTLE_MS = 15 * 60_000L

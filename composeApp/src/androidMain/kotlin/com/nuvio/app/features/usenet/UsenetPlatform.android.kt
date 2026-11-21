@@ -38,11 +38,13 @@ internal actual object UsenetPlatform {
     private val tester by lazy { NntpProviderTester() }
     private val tuner by lazy { NntpProviderTuner(tester) }
     private val service by lazy { BuiltInUsenetService(client, unplayable = unplayable, labels = ::localizedLabels, stats = sourceStats) }
-    private val sidecar by lazy { UsenetSidecar(appContext, { UsenetRepository.engineSettings() }, unplayable, sourceStats) }
+    private val sidecar by lazy {
+        UsenetSidecar(AndroidUsenetEngineHost(appContext), { UsenetRepository.engineSettings() }, unplayable, sourceStats)
+    }
 
     fun initialize(context: Context) {
         appContext = context.applicationContext
-        UsenetStartupReports.initialize(appContext)
+        UsenetStartupReports.initialize(SharedUsenetPreferences(appContext, UsenetStartupReports.PREFERENCES))
     }
 
     private val ready: Boolean get() = ::appContext.isInitialized

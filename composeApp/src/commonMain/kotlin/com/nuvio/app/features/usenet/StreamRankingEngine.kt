@@ -1,12 +1,8 @@
 package com.nuvio.app.features.usenet
 
-import com.google.re2j.Pattern
-import java.util.Locale
-import java.util.regex.Pattern as NativePattern
-
-/** User-written profile patterns run on RE2J, which rejects lookaround and backreferences. */
-internal actual fun isValidRankingPattern(value: String): Boolean =
-    runCatching { Pattern.compile(value, Pattern.CASE_INSENSITIVE) }.isSuccess
+import com.nuvio.app.features.streams.epochMs
+import kotlinx.atomicfu.locks.SynchronizedObject
+import kotlinx.atomicfu.locks.synchronized
 
 /** Facts are independent of preferences and parsed once for each incoming release. */
 internal data class StreamRankingFacts(
@@ -32,13 +28,13 @@ internal data class StreamRankingFacts(
 }
 
 /**
- * Its own fixed patterns run on java.util.regex, native on Android and about twice as fast as RE2J
- * for them; they stay linear in the bounded title, since none nests or leaves open a quantifier.
- * Patterns that users write in profiles stay on RE2J. `\z` ends the text as `$` does in RE2J
- * (java.util.regex's `$` also matches before a final line break).
+ * Its own fixed patterns run on the platform's regex (java.util.regex on Android, about twice as fast
+ * as RE2J for them); they stay linear in the bounded title, since none nests or leaves open a
+ * quantifier. Patterns that users write in profiles are [UserPattern]s. `\z` ends the text as `$`
+ * does in RE2J (java.util.regex's `$` also matches before a final line break).
  */
 private object StreamReleaseParser {
-    private fun pattern(value: String) = NativePattern.compile(value, NativePattern.CASE_INSENSITIVE)
+    private fun pattern(value: String) = Regex(value, RegexOption.IGNORE_CASE)
     private fun token(value: String) = pattern("(?:^|[^a-z0-9])(?:$value)(?:\\z|[^a-z0-9])")
     private val resolution = pattern("(?:^|[^0-9])(2160|1440|1080|720|576|480|360)p?(?:\\z|[^0-9])")
     private val uhd = token("4k|uhd")
@@ -74,13 +70,12 @@ private object StreamReleaseParser {
         "pl" to token("polish|pol"), "tr" to token("turkish|tur"), "multi" to token("multi|multi[ ._-]?audio"),
         "dual" to token("dual|dual[ ._-]?audio")
     )
-    private fun NativePattern.has(text: String) = matcher(text).find()
+    private fun Regex.has(text: String) = containsMatchIn(text)
     fun languages(title: String): Set<String> = languagePatterns.filterValues { it.has(title) }.keys.toSet()
     fun parse(title: String): StreamRankingFacts {
         // Bound custom/indexer input before applying even linear-time matchers.
-        val text = extension.matcher(title.take(2048)).replaceFirst("")
-        val match = resolution.matcher(text)
-        val pixels = if (match.find()) match.group(1).toInt() else if (uhd.has(text)) 2160 else 0
+        val text = extension.replaceFirst(title.take(2048), "")
+        val pixels = resolution.find(text)?.groupValues?.get(1)?.toInt() ?: if (uhd.has(text)) 2160 else 0
         val quality = when {
             cam.has(text) -> StreamReleaseQuality.CAM
             remux.has(text) -> StreamReleaseQuality.REMUX
@@ -109,13 +104,7 @@ private object StreamReleaseParser {
             if (ddp.has(text)) add("DDP")
             if (aac.has(text)) add("AAC")
         }
-        val suffix = group.matcher(text)
-        val prefix = animeGroup.matcher(text)
-        val releaseGroup = when {
-            suffix.find() -> suffix.group(1)
-            prefix.find() -> prefix.group(1)
-            else -> ""
-        }
+        val releaseGroup = group.find(text)?.groupValues?.get(1) ?: animeGroup.find(text)?.groupValues?.get(1) ?: ""
         return StreamRankingFacts(title = title.take(2048), resolution = pixels, quality = quality,
             codec = when { hevc.has(text) -> "HEVC"; av1.has(text) -> "AV1"; avc.has(text) -> "AVC"; else -> "UNKNOWN" },
             visual = visual, audio = audio, group = releaseGroup)
@@ -130,8 +119,8 @@ internal data class StreamRankingResult<T>(val candidate: StreamRankingCandidate
 /** Compiled once per settings snapshot, never inside a comparison or on a video player's tick. */
 internal class StreamRankingEngine(val profile: StreamRankingProfile) {
     private class Condition(val source: StreamRankingCondition) {
-        private val regex = if (source.operator == StreamRankingOperator.MATCHES) Pattern.compile(source.value, Pattern.CASE_INSENSITIVE) else null
-        private val values = source.value.split(',').map { it.trim().lowercase(Locale.ROOT) }.toSet()
+        private val regex = if (source.operator == StreamRankingOperator.MATCHES) UserPattern(source.value) else null
+        private val values = source.value.split(',').map { it.trim().lowercase() }.toSet()
         fun matches(facts: StreamRankingFacts, now: Long): Boolean {
             val numeric = when (source.field) {
                 StreamRankingField.RESOLUTION -> facts.resolution.toDouble()
@@ -164,10 +153,10 @@ internal class StreamRankingEngine(val profile: StreamRankingProfile) {
             }
             if (actual.isEmpty()) return false
             return when (source.operator) {
-                StreamRankingOperator.IS -> actual.any { it.lowercase(Locale.ROOT) in values }
-                StreamRankingOperator.IS_NOT -> actual.none { it.lowercase(Locale.ROOT) in values }
+                StreamRankingOperator.IS -> actual.any { it.lowercase() in values }
+                StreamRankingOperator.IS_NOT -> actual.none { it.lowercase() in values }
                 StreamRankingOperator.CONTAINS -> actual.any { it.contains(source.value, ignoreCase = true) }
-                StreamRankingOperator.MATCHES -> actual.any { regex!!.matcher(it).find() }
+                StreamRankingOperator.MATCHES -> actual.any { regex!!.containsMatchIn(it) }
                 else -> false
             }
         }
@@ -182,7 +171,7 @@ internal class StreamRankingEngine(val profile: StreamRankingProfile) {
     private val scoring = rules.filter { it.source.action == StreamRankingAction.BOOST }
     private val filtering = rules.filter { it.source.action != StreamRankingAction.BOOST }
 
-    fun <T> rank(candidates: List<StreamRankingCandidate<T>>, now: Long = System.currentTimeMillis()): List<StreamRankingResult<T>> {
+    fun <T> rank(candidates: List<StreamRankingCandidate<T>>, now: Long = epochMs()): List<StreamRankingResult<T>> {
         var accepted = candidates
         for (rule in filtering) {
             val filtered = accepted.filter {
@@ -233,7 +222,7 @@ internal class StreamRankingEngine(val profile: StreamRankingProfile) {
         val overflow = mutableListOf<StreamRankingResult<T>>()
         ranked.forEach {
             val key = Triple(it.candidate.reliability, it.candidate.facts.resolution, it.candidate.facts.quality)
-            val count = counts.getOrDefault(key, 0)
+            val count = counts[key] ?: 0
             counts[key] = count + 1
             if (count < profile.topPerBucket) leaders += it else overflow += it.copy(overflow = true)
         }
@@ -252,8 +241,14 @@ internal class StreamRankingEngine(val profile: StreamRankingProfile) {
 
 /** A small process cache; editing a profile replaces its compiled matchers instead of growing it forever. */
 internal object StreamRankingEngines {
-    private val engines = object : LinkedHashMap<StreamRankingProfile, StreamRankingEngine>(8, 0.75f, true) {
-        override fun removeEldestEntry(eldest: MutableMap.MutableEntry<StreamRankingProfile, StreamRankingEngine>?) = size > 8
+    private val lock = SynchronizedObject()
+    /** Least recently used first. */
+    private val engines = LinkedHashMap<StreamRankingProfile, StreamRankingEngine>()
+
+    fun get(profile: StreamRankingProfile): StreamRankingEngine = synchronized(lock) {
+        val engine = engines.remove(profile) ?: StreamRankingEngine(profile)
+        engines[profile] = engine
+        if (engines.size > 8) engines.remove(engines.keys.first())
+        engine
     }
-    @Synchronized fun get(profile: StreamRankingProfile): StreamRankingEngine = engines.getOrPut(profile) { StreamRankingEngine(profile) }
 }

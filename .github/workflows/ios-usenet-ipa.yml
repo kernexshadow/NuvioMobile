@@ -24,9 +24,10 @@ concurrency:
 jobs:
   build:
     name: Build unsigned full IPA
-    runs-on: macos-26
+    runs-on: xcode-27
     timeout-minutes: 90
     env:
+      DEVELOPER_DIR: /Applications/Xcode_27.1.app/Contents/Developer
       GRADLE_OPTS: -Dfile.encoding=UTF-8
       IOS_CONFIGURATION: ${{ inputs.configuration || 'Debug' }}
       KOTLIN_DAEMON_JVMARGS: -Xmx2048M
@@ -37,12 +38,6 @@ jobs:
     steps:
       - name: Check out source
         uses: actions/checkout@v6
-
-      - name: Select the newest Xcode
-        run: |
-          ls -d /Applications/Xcode*.app
-          xcode="$(ls -d /Applications/Xcode_*.app | sort -V | tail -n 1)"
-          echo "DEVELOPER_DIR=${xcode}/Contents/Developer" >> "${GITHUB_ENV}"
 
       - name: Set up Java
         uses: actions/setup-java@v5

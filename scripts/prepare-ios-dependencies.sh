@@ -12,6 +12,38 @@ if [[ ! -f "${repository_root}/MPVKit/Package.swift" ]]; then
     git -C "${repository_root}" submodule update --init --depth 1 MPVKit
 fi
 
+# The Usenet engine as a static library (iOS apps cannot start its Android sidecar process).
+usenet_engine_tag=ios-library-37208cb
+usenet_engine_checksum=bc7cde18c2821840c1e0ab41bc2c5466856f087756da60708199edb9813ceb58
+usenet_engine_repository="${NUVIO_USENET_ENGINE_REPOSITORY:-kernexshadow/nuvio-usenet-engine-nuviomedia}"
+usenet_framework="${repository_root}/../nuvio-usenet-engine/build/ios/NuvioUsenet.xcframework"
+
+prepare_usenet_engine() {
+    if [[ -f "${usenet_framework}/Info.plist" ]]; then
+        return 0
+    fi
+    local temporary
+    temporary="$(mktemp -d "${TMPDIR:-/tmp}/nuvio-usenet-engine.XXXXXX")"
+    local archive="${temporary}/NuvioUsenet.xcframework.zip"
+    curl --fail --location --retry 5 --retry-all-errors --silent --show-error         --output "${archive}"         "https://github.com/${usenet_engine_repository}/releases/download/${usenet_engine_tag}/NuvioUsenet.xcframework.zip"
+    if [[ "$(shasum -a 256 "${archive}" | awk '{print $1}')" != "${usenet_engine_checksum}" ]]; then
+        echo "Usenet engine Apple package checksum mismatch." >&2
+        rm -rf "${temporary}"
+        return 1
+    fi
+    unzip -q "${archive}" -d "${temporary}/extracted"
+    if [[ ! -f "${temporary}/extracted/NuvioUsenet.xcframework/ios-arm64/libnuvio_usenet.a" ]]; then
+        echo "Usenet engine Apple package does not contain the iOS arm64 library." >&2
+        rm -rf "${temporary}"
+        return 1
+    fi
+    mkdir -p "$(dirname "${usenet_framework}")"
+    ditto "${temporary}/extracted/NuvioUsenet.xcframework" "${usenet_framework}"
+    rm -rf "${temporary}"
+}
+
+prepare_usenet_engine
+
 if [[ -f "${engine_framework}/Info.plist" ]]; then
     exit 0
 fi

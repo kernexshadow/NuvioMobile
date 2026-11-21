@@ -1,0 +1,5 @@
+headers = nuvio_usenet.h
+package = com.nuvio.app.features.usenet.native
+staticLibraries = libnuvio_usenet.a
+# The engine is Go: its runtime and crypto/x509 need these when the app is linked.
+linkerOpts = -framework Security -framework CoreFoundation -lresolv -lc++

@@ -51,6 +51,8 @@ internal actual object UsenetPlatform {
 
     actual val isSupported: Boolean = true
 
+    actual val providerToolsSupported: Boolean = true
+
     // The statistics learn the providers' server URLs, so engine reports, which name servers by URL, count for them.
     actual fun loadSources(profileId: Int): UsenetSourceConfiguration =
         sourceStorage.read(profileId).also { sourceStats.knowProviders(it.providers) }

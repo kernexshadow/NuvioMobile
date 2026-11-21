@@ -218,7 +218,8 @@ internal fun UsenetProviderSheet(
             UsenetPriorityChips(priority, stringResource(Res.string.usenet_provider_priority_hint)) { priority = it }
             UsenetSwitchLine(stringResource(Res.string.usenet_source_enabled), enabled) { enabled = it }
 
-            OutlinedButton(
+            // Testing needs raw NNTP sockets, which iOS builds do not have yet.
+            if (UsenetPlatform.providerToolsSupported) OutlinedButton(
                 onClick = {
                     val provider = entered()
                     if (provider == null) {
@@ -265,7 +266,7 @@ internal fun UsenetProviderSheet(
                 Text(stringResource(Res.string.usenet_provider_invalid), style = MaterialTheme.typography.bodySmall, color = tokens.colors.danger)
             }
             // Tuning measures the saved provider, so it is offered once the provider exists.
-            if (existing != null) {
+            if (existing != null && UsenetPlatform.providerToolsSupported) {
                 OutlinedButton(
                     onClick = { tuning = true },
                     enabled = !testing,

@@ -50,10 +50,14 @@ class UsenetPlaybackException(
 
 /**
  * What runs only where the Usenet engine exists: credential storage, indexer searches, provider
- * tests and the engine itself. Android launches the engine as a child process; iOS has none.
+ * tests and the engine itself. Android launches the engine as a child process; iOS Full links it as
+ * a library.
  */
 internal expect object UsenetPlatform {
     val isSupported: Boolean
+
+    /** Whether the provider test and connection tuning run here; they need raw NNTP sockets. */
+    val providerToolsSupported: Boolean
 
     /** Decrypts the profile's sources; throws when the device keystore cannot read them. */
     fun loadSources(profileId: Int): UsenetSourceConfiguration

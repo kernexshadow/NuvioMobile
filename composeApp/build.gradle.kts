@@ -258,6 +258,7 @@ val iosDistributionSourceDir = if (iosDistribution == "full") {
 }
 val iosFrameworkBundleId = "com.nuvio.media"
 val nuvioEngineAppleFramework = rootProject.file("../nuvio-engine/platform/apple/NuvioEngine.xcframework")
+val nuvioUsenetAppleFramework = rootProject.file("../nuvio-usenet-engine/build/ios/NuvioUsenet.xcframework")
 val fullCommonSourceDir = project.file("src/fullCommonMain/kotlin")
 val generatedRuntimeConfigDir = layout.buildDirectory.dir("generated/runtime-config/kotlin")
 val requestedGradleTasks = gradle.startParameter.taskNames.map { taskName ->
@@ -367,6 +368,7 @@ kotlin {
             "ios-arm64_x86_64-simulator"
         }
         val nuvioEngineSliceDirectory = nuvioEngineAppleFramework.resolve(nuvioEngineSlice)
+        val nuvioUsenetSliceDirectory = nuvioUsenetAppleFramework.resolve(nuvioEngineSlice)
         iosTarget.compilations.getByName("main") {
             cinterops {
                 create("commoncrypto") {
@@ -385,6 +387,14 @@ kotlin {
                         defFile(project.file("src/nativeInterop/cinterop/nuvioengine.def"))
                         compilerOpts("-I${nuvioEngineSliceDirectory.resolve("Headers").absolutePath}")
                         extraOpts("-libraryPath", nuvioEngineSliceDirectory.absolutePath)
+                    }
+                    check(nuvioUsenetSliceDirectory.resolve("libnuvio_usenet.a").isFile) {
+                        "Run scripts/prepare-ios-dependencies.sh for the Usenet engine XCFramework before compiling iOS Full."
+                    }
+                    create("nuviousenet") {
+                        defFile(project.file("src/nativeInterop/cinterop/nuviousenet.def"))
+                        compilerOpts("-I${nuvioUsenetSliceDirectory.resolve("Headers").absolutePath}")
+                        extraOpts("-libraryPath", nuvioUsenetSliceDirectory.absolutePath)
                     }
                 }
                 configureEach {
@@ -412,6 +422,7 @@ kotlin {
             if (iosDistribution == "full") {
                 linkerOpts(
                     "-lc++",
+                    "-lresolv",
                     "-framework", "Security",
                     "-framework", "SystemConfiguration",
                     "-framework", "CoreFoundation",

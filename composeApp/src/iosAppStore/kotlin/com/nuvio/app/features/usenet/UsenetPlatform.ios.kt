@@ -8,11 +8,13 @@ import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.flow.emptyFlow
 
-/** iOS cannot launch the Usenet engine as a child process: the feature stays hidden. */
+/** The App Store build links no Usenet engine: the feature stays hidden. */
 internal actual object UsenetPlatform {
     private val unchanged = MutableStateFlow(0).asStateFlow()
 
     actual val isSupported: Boolean = false
+
+    actual val providerToolsSupported: Boolean = false
 
     actual fun loadSources(profileId: Int): UsenetSourceConfiguration = UsenetSourceConfiguration()
 

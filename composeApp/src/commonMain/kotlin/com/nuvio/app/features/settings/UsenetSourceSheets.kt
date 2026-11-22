@@ -295,17 +295,19 @@ internal fun UsenetProviderSheet(
                 },
             )
         }
-    }
 
-    if (confirmDelete) {
-        UsenetDeleteDialog(
-            onConfirm = {
-                confirmDelete = false
-                UsenetRepository.updateSources { config -> config.copy(providers = config.providers.filterNot { it.id == initial.id }) }
-                close()
-            },
-            onDismiss = { confirmDelete = false },
-        )
+        // Inside the sheet: on iOS the sheet is its own presented screen, so a dialog composed
+        // outside it would open behind the sheet.
+        if (confirmDelete) {
+            UsenetDeleteDialog(
+                onConfirm = {
+                    confirmDelete = false
+                    UsenetRepository.updateSources { config -> config.copy(providers = config.providers.filterNot { it.id == initial.id }) }
+                    close()
+                },
+                onDismiss = { confirmDelete = false },
+            )
+        }
     }
 
     if (tuning) {
@@ -463,17 +465,18 @@ internal fun UsenetIndexerSheet(
                 },
             )
         }
-    }
 
-    if (confirmDelete) {
-        UsenetDeleteDialog(
-            onConfirm = {
-                confirmDelete = false
-                UsenetRepository.updateSources { config -> config.copy(indexers = config.indexers.filterNot { it.id == initial.id }) }
-                close()
-            },
-            onDismiss = { confirmDelete = false },
-        )
+        // Inside the sheet, as for providers: outside it the dialog opens behind the iOS sheet.
+        if (confirmDelete) {
+            UsenetDeleteDialog(
+                onConfirm = {
+                    confirmDelete = false
+                    UsenetRepository.updateSources { config -> config.copy(indexers = config.indexers.filterNot { it.id == initial.id }) }
+                    close()
+                },
+                onDismiss = { confirmDelete = false },
+            )
+        }
     }
 }
 

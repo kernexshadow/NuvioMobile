@@ -1,8 +1,7 @@
 name: Usenet iOS IPA
 
 on:
-  push:
-    branches: [feat/usenet-ios]
+  # Manual only: each run is a long macOS build.
   workflow_dispatch:
     inputs:
       configuration:

@@ -35,6 +35,7 @@ import androidx.compose.runtime.rememberCoroutineScope
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.text.input.ImeAction
 import androidx.compose.ui.text.input.KeyboardCapitalization
 import androidx.compose.ui.text.input.KeyboardType
@@ -287,25 +288,19 @@ internal fun UsenetProviderSheet(
             SheetActions(
                 existing = existing != null,
                 onSave = ::save,
+                confirmingDelete = confirmDelete,
                 onDelete = { confirmDelete = true },
+                onCancelDelete = { confirmDelete = false },
+                onConfirmDelete = {
+                    confirmDelete = false
+                    UsenetRepository.updateSources { config -> config.copy(providers = config.providers.filterNot { it.id == initial.id }) }
+                    close()
+                },
                 onMove = { direction ->
                     UsenetRepository.updateSources { config ->
                         config.copy(providers = config.providers.moveWithinPriority(initial.id, direction, { it.id }, { it.priority }))
                     }
                 },
-            )
-        }
-
-        // Inside the sheet: on iOS the sheet is its own presented screen, so a dialog composed
-        // outside it would open behind the sheet.
-        if (confirmDelete) {
-            UsenetDeleteDialog(
-                onConfirm = {
-                    confirmDelete = false
-                    UsenetRepository.updateSources { config -> config.copy(providers = config.providers.filterNot { it.id == initial.id }) }
-                    close()
-                },
-                onDismiss = { confirmDelete = false },
             )
         }
     }
@@ -457,7 +452,14 @@ internal fun UsenetIndexerSheet(
             SheetActions(
                 existing = existing != null,
                 onSave = ::save,
+                confirmingDelete = confirmDelete,
                 onDelete = { confirmDelete = true },
+                onCancelDelete = { confirmDelete = false },
+                onConfirmDelete = {
+                    confirmDelete = false
+                    UsenetRepository.updateSources { config -> config.copy(indexers = config.indexers.filterNot { it.id == initial.id }) }
+                    close()
+                },
                 onMove = { direction ->
                     UsenetRepository.updateSources { config ->
                         config.copy(indexers = config.indexers.moveWithinPriority(initial.id, direction, { it.id }, { it.priority }))
@@ -465,26 +467,22 @@ internal fun UsenetIndexerSheet(
                 },
             )
         }
-
-        // Inside the sheet, as for providers: outside it the dialog opens behind the iOS sheet.
-        if (confirmDelete) {
-            UsenetDeleteDialog(
-                onConfirm = {
-                    confirmDelete = false
-                    UsenetRepository.updateSources { config -> config.copy(indexers = config.indexers.filterNot { it.id == initial.id }) }
-                    close()
-                },
-                onDismiss = { confirmDelete = false },
-            )
-        }
     }
 }
 
+/**
+ * Save, then reordering and deleting for an existing source. Deleting is confirmed here, in place of
+ * these actions, rather than in a dialog: on iOS a sheet is its own presented screen, and a dialog
+ * opened from it can end up behind it.
+ */
 @Composable
 private fun SheetActions(
     existing: Boolean,
     onSave: () -> Unit,
+    confirmingDelete: Boolean,
     onDelete: () -> Unit,
+    onCancelDelete: () -> Unit,
+    onConfirmDelete: () -> Unit,
     onMove: (Int) -> Unit,
 ) {
     val tokens = MaterialTheme.nuvio
@@ -497,7 +495,29 @@ private fun SheetActions(
     ) {
         Text(stringResource(Res.string.usenet_save))
     }
-    if (existing) {
+    if (existing && confirmingDelete) {
+        Text(
+            text = stringResource(Res.string.usenet_delete_confirm),
+            style = MaterialTheme.typography.bodyMedium,
+            color = tokens.colors.textSecondary,
+        )
+        Row(
+            modifier = Modifier.fillMaxWidth(),
+            horizontalArrangement = Arrangement.spacedBy(NuvioTokens.Space.s12),
+        ) {
+            OutlinedButton(
+                onClick = onCancelDelete,
+                modifier = Modifier.weight(1f),
+                shape = tokens.shapes.button,
+            ) { Text(stringResource(Res.string.usenet_cancel)) }
+            Button(
+                onClick = onConfirmDelete,
+                modifier = Modifier.weight(1f),
+                shape = tokens.shapes.button,
+                colors = ButtonDefaults.buttonColors(containerColor = tokens.colors.danger, contentColor = Color.White),
+            ) { Text(stringResource(Res.string.usenet_delete)) }
+        }
+    } else if (existing) {
         Row(
             modifier = Modifier.fillMaxWidth(),
             horizontalArrangement = Arrangement.SpaceBetween,
@@ -510,21 +530,6 @@ private fun SheetActions(
             TextButton(onClick = onDelete) {
                 Text(stringResource(Res.string.usenet_source_delete), color = tokens.colors.danger)
             }
-        }
-    }
-}
-
-@Composable
-private fun UsenetDeleteDialog(onConfirm: () -> Unit, onDismiss: () -> Unit) {
-    DialogSurface(onDismissRequest = onDismiss, title = stringResource(Res.string.usenet_source_delete)) {
-        Text(
-            text = stringResource(Res.string.usenet_delete_confirm),
-            style = MaterialTheme.typography.bodyMedium,
-            color = MaterialTheme.nuvio.colors.textSecondary,
-        )
-        DialogButtons {
-            DialogButton(text = stringResource(Res.string.usenet_cancel), onClick = onDismiss)
-            DialogButton(text = stringResource(Res.string.usenet_delete), onClick = onConfirm, style = DialogButtonStyle.Primary)
         }
     }
 }

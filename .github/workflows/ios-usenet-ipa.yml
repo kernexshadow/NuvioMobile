@@ -71,6 +71,14 @@ jobs:
           printf '%s' "${RELEASE_PROPERTIES_BASE64}" | base64 --decode > local.properties
           sed -i '' -E '/^[[:space:]]*(sdk\.dir|NUVIO_RELEASE_STORE_FILE)[[:space:]]*=/d' local.properties
 
+      - name: Number this test build
+        # Each run gets its own build number, shown by sideloaders as "(N)", so testers can tell builds apart.
+        run: |
+          build_number=$((1000 + ${{ github.run_number }}))
+          sed -i '' -E "s/^CURRENT_PROJECT_VERSION=.*/CURRENT_PROJECT_VERSION=${build_number}/" iosApp/Configuration/Version.xcconfig
+          cat iosApp/Configuration/Version.xcconfig
+          echo "## Build number ${build_number}" >> "${GITHUB_STEP_SUMMARY}"
+
       - name: Prepare iOS dependencies
         run: ./scripts/prepare-ios-dependencies.sh
 

@@ -11,6 +11,7 @@ import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.navigationBarsPadding
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
+import androidx.compose.foundation.ScrollState
 import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.text.KeyboardOptions
 import androidx.compose.foundation.verticalScroll
@@ -28,11 +29,13 @@ import androidx.compose.material3.Text
 import androidx.compose.material3.TextButton
 import androidx.compose.material3.rememberModalBottomSheetState
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.rememberCoroutineScope
 import androidx.compose.runtime.setValue
+import androidx.compose.runtime.withFrameNanos
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.graphics.Color
@@ -176,11 +179,13 @@ internal fun UsenetProviderSheet(
     }
 
     NuvioModalBottomSheet(onDismissRequest = onDismiss, sheetState = sheetState) {
+        val scroll = rememberScrollState()
+        DeleteQuestionInView(confirmDelete, scroll)
         Column(
             modifier = Modifier
                 .fillMaxWidth()
                 .navigationBarsPadding()
-                .verticalScroll(rememberScrollState())
+                .verticalScroll(scroll)
                 .padding(start = tokens.spacing.sheetPadding, end = tokens.spacing.sheetPadding, bottom = tokens.spacing.sheetPadding),
             verticalArrangement = Arrangement.spacedBy(NuvioTokens.Space.s12),
         ) {
@@ -363,11 +368,13 @@ internal fun UsenetIndexerSheet(
     }
 
     NuvioModalBottomSheet(onDismissRequest = onDismiss, sheetState = sheetState) {
+        val scroll = rememberScrollState()
+        DeleteQuestionInView(confirmDelete, scroll)
         Column(
             modifier = Modifier
                 .fillMaxWidth()
                 .navigationBarsPadding()
-                .verticalScroll(rememberScrollState())
+                .verticalScroll(scroll)
                 .padding(start = tokens.spacing.sheetPadding, end = tokens.spacing.sheetPadding, bottom = tokens.spacing.sheetPadding),
             verticalArrangement = Arrangement.spacedBy(NuvioTokens.Space.s12),
         ) {
@@ -467,6 +474,17 @@ internal fun UsenetIndexerSheet(
                 },
             )
         }
+    }
+}
+
+/** Scrolls the sheet to the delete question and its buttons when it appears at the bottom. */
+@Composable
+private fun DeleteQuestionInView(confirmingDelete: Boolean, scroll: ScrollState) {
+    LaunchedEffect(confirmingDelete) {
+        if (!confirmingDelete) return@LaunchedEffect
+        // The question is laid out in the next frame; scroll once its height counts.
+        withFrameNanos { }
+        scroll.animateScrollTo(scroll.maxValue)
     }
 }
 
